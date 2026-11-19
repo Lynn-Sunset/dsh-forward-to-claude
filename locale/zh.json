@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "转发给 Claude",
+    "description": "为当前会话生成仅含英文的交接包，包含经过校验的翻译和可直接使用的 Claude 提示词。",
+    "detail": "docs/DETAIL.md"
+  }
+}

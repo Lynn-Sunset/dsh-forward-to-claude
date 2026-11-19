@@ -1,0 +1,54 @@
+{
+  "name": "dsh-forward-to-claude",
+  "version": "1.0.0",
+  "description": "A DeepSeek Harness bundle that creates an English-only, trace-free handoff bundle and a ready-to-paste Claude prompt.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "icon.svg"
+  ],
+  "scripts": {
+    "test": "node --test --test-isolation=none tests/integration.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "claude",
+    "handoff",
+    "translation",
+    "privacy",
+    "redaction"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT",
+  "author": "dsh-forward-to-claude contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/dsh-forward-to-claude.git"
+  },
+  "homepage": "https://github.com/OWNER/dsh-forward-to-claude#readme",
+  "bugs": {
+    "url": "https://github.com/OWNER/dsh-forward-to-claude/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

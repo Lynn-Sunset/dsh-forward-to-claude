@@ -1,0 +1,4 @@
+- insert:
+    - id: forward-to-claude
+      name: 'dsh-forward-to-claude'
+      config: {}

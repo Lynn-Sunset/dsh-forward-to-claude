@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Generated handoff bundles
+forward-to-claude/
+
+# Test/evidence output
+tests/evidence/
+coverage/
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Package artifacts
+*.tgz

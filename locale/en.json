@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Forward to Claude",
+    "description": "Creates a session-specific English-only handoff bundle, with a verified translation and a ready-to-use prompt for Claude.",
+    "detail": "docs/DETAIL.md"
+  }
+}
