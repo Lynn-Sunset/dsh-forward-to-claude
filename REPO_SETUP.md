@@ -31,8 +31,8 @@ git push -u origin main
 ## 3. Tag the release
 
 ```bash
-git tag -a v1.0.2 -m "dsh-forward-to-claude 1.0.2"
-git push origin v1.0.2
+git tag -a v1.0.3 -m "dsh-forward-to-claude 1.0.3"
+git push origin v1.0.3
 ```
 
 Create a GitHub Release from that tag and paste the relevant

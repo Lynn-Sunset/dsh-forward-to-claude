@@ -380,7 +380,7 @@ spec can be used after the repository is published.
 
 ## Test
 
-The automated suite at `tests/integration.mjs` has forty test cases: the
+The automated suite at `tests/integration.mjs` has forty-one test cases: the
 end-to-end `start`/`finalize` path; negative finalize cases (false review
 placeholders, dropped section, injected CJK from every covered block,
 dishonest review, missing handoff); a skipped-answer case; loud-failure cases;
@@ -404,9 +404,11 @@ structured alias for one entity and publish under it; transactional finalize
 preflight/rollback/manifest-last; interrupted-publish recovery and fresh-process
 resume; status incomplete/invalid/ready validation with both staging files
 required; eleven same-second numeric-suffix ordering; timestamp and
-unsuffixed-suffix ordering; and file-symlink boundary cases that skip only when
-the OS denies file symlinks. The package test/engine contract is asserted as
-well. The junction cases skip only when the OS denies junction creation. Run:
+unsuffixed-suffix ordering; a throwing-clock Host harness regression proving
+`start` does not read an uninjected clock service; and file-symlink boundary
+cases that skip only when the OS denies file symlinks. The package test/engine
+contract is asserted as well. The junction cases skip only when the OS denies
+junction creation. Run:
 
 ```
 node --test tests/integration.mjs

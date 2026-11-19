@@ -119,10 +119,10 @@ const FIXTURE_CONVERSATION = [
 
 /**
  * Build a stubbed Host context and execute one `apply(ctx)`.
- * @param {{ cwd: string, answers: object[][], messages: object[], sessionId?: string, visible?: boolean, clock?: object, forwardTestHooks?: object }} options - Fixtures.
+ * @param {{ cwd: string, answers: object[][], messages: object[], sessionId?: string, visible?: boolean, forwardTestHooks?: object }} options - Fixtures.
  * @returns {object} Harness handles.
  */
-function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible = true, clock, forwardTestHooks }) {
+function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible = true, forwardTestHooks }) {
   const definitions = []
   const sections = []
   const asks = []
@@ -138,7 +138,6 @@ function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible
     signal: new AbortController().signal,
   }
   const ctx = {
-    clock,
     forwardToClaudeTestHooks: forwardTestHooks,
     effect(callback) {
       const cleanup = callback()
@@ -179,6 +178,16 @@ function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible
       },
     },
   }
+  // Real Cordis throws when a plugin reads a service it did not inject.
+  // Reproduce that behavior for the clock service so the production path
+  // cannot silently reintroduce an uninjected service access.
+  Object.defineProperty(ctx, 'clock', {
+    configurable: true,
+    enumerable: false,
+    get() {
+      throw new Error('cannot get property "clock" without inject')
+    },
+  })
   plugin.apply(ctx)
   return { ctx, exec, definitions, sections, asks, effects, disposed, cwd, session }
 }
@@ -208,6 +217,33 @@ async function makeCwd() {
 /** Create a temporary directory outside the working directory used by junction tests. */
 async function makeOutsideDir() {
   return realpath(await mkdtemp(join(tmpdir(), 'dsh-forward-claude-outside-')))
+}
+
+/**
+ * Run a callback with a fixed wall clock. The production path intentionally
+ * uses `new Date()` rather than an injected clock service, so tests freeze the
+ * standard Date constructor instead of adding a non-Cordis context property.
+ * @param {() => number} getTime - Current fixed epoch milliseconds.
+ * @param {() => Promise<unknown>} callback - Test body.
+ * @returns {Promise<unknown>} Callback result.
+ */
+async function withFixedDate(getTime, callback) {
+  const RealDate = globalThis.Date
+  class FixedDate extends RealDate {
+    constructor(...args) {
+      super(...(args.length === 0 ? [getTime()] : args))
+    }
+
+    static now() {
+      return getTime()
+    }
+  }
+  globalThis.Date = FixedDate
+  try {
+    return await callback()
+  } finally {
+    globalThis.Date = RealDate
+  }
 }
 
 /**
@@ -244,8 +280,8 @@ async function assertStagedOnly(folder) {
  * @param {{ cwd: string, noteText?: string, sessionId?: string }} options - Fixture.
  * @returns {Promise<object>} Harness, start result, folder, and brief.
  */
-async function startNoteBundle({ cwd, noteText = 'handoff note', sessionId = SESSION_ID, clock, forwardTestHooks }) {
-  const harness = createHarness({ cwd, answers: noteOnlyAnswers(noteText), messages: [], sessionId, clock, forwardTestHooks })
+async function startNoteBundle({ cwd, noteText = 'handoff note', sessionId = SESSION_ID, forwardTestHooks }) {
+  const harness = createHarness({ cwd, answers: noteOnlyAnswers(noteText), messages: [], sessionId, forwardTestHooks })
   const definition = harness.definitions[0]
   const started = await definition.execute({ action: 'start' }, harness.exec)
   const folder = fromCwd(started.folder, cwd)
@@ -2121,49 +2157,52 @@ test('an empty latest bundle is incomplete and cannot be finalized', async () =>
 
 test('eleven same-second starts sort by numeric suffix and select -10', async () => {
   const cwd = await makeCwd()
-  const fixed = new Date('2026-11-19T12:00:00Z')
+  const fixed = new Date('2026-11-19T12:00:00Z').getTime()
   const answers = Array.from({ length: 11 }, () => noteOnlyAnswers('same-second note')).flat()
-  const harness = createHarness({ cwd, answers, messages: [], clock: { now: () => fixed } })
+  const harness = createHarness({ cwd, answers, messages: [] })
   const definition = harness.definitions[0]
-  for (let index = 0; index < 11; index += 1) {
-    await definition.execute({ action: 'start' }, harness.exec)
-  }
-  const sessionDir = join(cwd, 'forward-to-claude', SESSION_ID)
-  const names = (await readdir(sessionDir)).sort()
-  assert.deepEqual(names, [
-    'handoff-20261119-120000',
-    ...Array.from({ length: 10 }, (_, index) => `handoff-20261119-120000-${index + 1}`),
-  ].sort())
-  const selected = await definition.execute({ action: 'status' }, harness.exec)
-  assert.equal(basename(fromCwd(selected.folder, cwd)), 'handoff-20261119-120000-10')
-  assert.equal(selected.status, 'awaiting_translation')
-  const latestBrief = JSON.parse(await readFile(join(sessionDir, 'handoff-20261119-120000-10', 'BRIEF.json'), 'utf8'))
-  const ready = await definition.execute(finalizeArgs(latestBrief), harness.exec)
-  assert.equal(ready.status, 'ready')
-  assert.equal(basename(fromCwd(ready.folder, cwd)), 'handoff-20261119-120000-10')
-  const after = await definition.execute({ action: 'status' }, harness.exec)
-  assert.equal(after.status, 'ready')
-  assert.equal(basename(fromCwd(after.folder, cwd)), 'handoff-20261119-120000-10')
+  await withFixedDate(() => fixed, async () => {
+    for (let index = 0; index < 11; index += 1) {
+      await definition.execute({ action: 'start' }, harness.exec)
+    }
+    const sessionDir = join(cwd, 'forward-to-claude', SESSION_ID)
+    const names = (await readdir(sessionDir)).sort()
+    assert.deepEqual(names, [
+      'handoff-20261119-120000',
+      ...Array.from({ length: 10 }, (_, index) => `handoff-20261119-120000-${index + 1}`),
+    ].sort())
+    const selected = await definition.execute({ action: 'status' }, harness.exec)
+    assert.equal(basename(fromCwd(selected.folder, cwd)), 'handoff-20261119-120000-10')
+    assert.equal(selected.status, 'awaiting_translation')
+    const latestBrief = JSON.parse(await readFile(join(sessionDir, 'handoff-20261119-120000-10', 'BRIEF.json'), 'utf8'))
+    const ready = await definition.execute(finalizeArgs(latestBrief), harness.exec)
+    assert.equal(ready.status, 'ready')
+    assert.equal(basename(fromCwd(ready.folder, cwd)), 'handoff-20261119-120000-10')
+    const after = await definition.execute({ action: 'status' }, harness.exec)
+    assert.equal(after.status, 'ready')
+    assert.equal(basename(fromCwd(after.folder, cwd)), 'handoff-20261119-120000-10')
+  })
 })
 
 test('timestamp ordering and the unsuffixed default-0 suffix are both respected', async () => {
   const cwd = await makeCwd()
-  let now = new Date('2026-11-19T12:00:00Z')
+  let now = new Date('2026-11-19T12:00:00Z').getTime()
   const harness = createHarness({
     cwd,
     answers: Array.from({ length: 3 }, () => noteOnlyAnswers('ordering note')).flat(),
     messages: [],
-    clock: { now: () => now },
   })
   const definition = harness.definitions[0]
-  await definition.execute({ action: 'start' }, harness.exec)
-  await definition.execute({ action: 'start' }, harness.exec)
-  const suffixed = await definition.execute({ action: 'status' }, harness.exec)
-  assert.equal(basename(fromCwd(suffixed.folder, cwd)), 'handoff-20261119-120000-1')
-  now = new Date('2026-11-19T12:00:01Z')
-  await definition.execute({ action: 'start' }, harness.exec)
-  const newer = await definition.execute({ action: 'status' }, harness.exec)
-  assert.equal(basename(fromCwd(newer.folder, cwd)), 'handoff-20261119-120001')
+  await withFixedDate(() => now, async () => {
+    await definition.execute({ action: 'start' }, harness.exec)
+    await definition.execute({ action: 'start' }, harness.exec)
+    const suffixed = await definition.execute({ action: 'status' }, harness.exec)
+    assert.equal(basename(fromCwd(suffixed.folder, cwd)), 'handoff-20261119-120000-1')
+    now = new Date('2026-11-19T12:00:01Z').getTime()
+    await definition.execute({ action: 'start' }, harness.exec)
+    const newer = await definition.execute({ action: 'status' }, harness.exec)
+    assert.equal(basename(fromCwd(newer.folder, cwd)), 'handoff-20261119-120001')
+  })
 })
 
 test('symlinked HANDOFF.md is refused before writes and its target is untouched', async (t) => {
@@ -2218,6 +2257,21 @@ test('symlinked manifest.json makes status invalid and finalize refuses it', asy
     /symlink|non-regular/i,
   )
   assert.equal(await exists(target), true)
+})
+
+test('start does not read an uninjected clock service', async () => {
+  const cwd = await makeCwd()
+  const harness = createHarness({
+    cwd,
+    answers: noteOnlyAnswers('clock regression'),
+    messages: [],
+  })
+  // createHarness installs a throwing `clock` getter that mirrors Cordis.
+  const started = await harness.definitions[0].execute({ action: 'start' }, harness.exec)
+  assert.equal(typeof started.folder, 'string')
+  assert.equal(started.status, 'awaiting_translation')
+  const status = await harness.definitions[0].execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'awaiting_translation')
 })
 
 test('package test script and Node engine range are portable', async () => {

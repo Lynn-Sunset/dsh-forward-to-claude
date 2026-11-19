@@ -935,7 +935,7 @@ async function runStart(ctx, exec) {
   const traceLedger = buildTraceLedger(sections)
   const sourceText = renderSource(sections)
   const brief = buildBrief({ sessionId, sections, sourceText, files: fileRecords, regionalTraceSummary, traces: traceLedger })
-  const folder = await createHandoffFolder(cwd, realCwd, sessionId, clockNow(ctx))
+  const folder = await createHandoffFolder(cwd, realCwd, sessionId, new Date())
   const sourcePath = join(folder, 'SOURCE.md')
   await writeAtomic(sourcePath, sourceText)
   await writeJsonAtomic(join(folder, 'BRIEF.json'), brief, 'BRIEF.json')
@@ -2173,21 +2173,6 @@ async function inspectBundleState(folder, realFolder, realCwd) {
   }
   if (staging.every((info) => info.regular === true)) return { status: 'awaiting_translation' }
   return { status: 'incomplete', reason: 'no_staging_or_manifest' }
-}
-
-/**
- * Current time for handoff folder naming, with an optional test clock.
- * @param {object} ctx - Host plugin context.
- * @returns {Date} Current or test time.
- */
-function clockNow(ctx) {
-  const candidate = ctx?.clock?.now
-  if (typeof candidate === 'function') {
-    const value = candidate()
-    if (value instanceof Date && Number.isFinite(value.getTime())) return value
-  }
-  if (candidate instanceof Date && Number.isFinite(candidate.getTime())) return candidate
-  return new Date()
 }
 
 /**

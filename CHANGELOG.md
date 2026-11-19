@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.3] - 2026-11-19
+
+Runtime compatibility fix.
+
+- Removed the undeclared `ctx.clock` service access from `start`. Production
+  folder naming now uses the standard `new Date()`; Cordis rejects reading an
+  uninjected service property even through optional chaining.
+- Tests no longer inject a mock `clock` into the Host context. The harness now
+  installs a throwing `clock` getter that mirrors Cordis, and fixed-time tests
+  freeze the standard `Date` constructor instead.
+- Added a regression that calls `start` against the throwing-clock harness.
+- Version bumped to 1.0.3; release archives rebuilt.
+
 ## [1.0.2] - 2026-11-19
 
 Interrupted-publish recovery and completeness fixes.
