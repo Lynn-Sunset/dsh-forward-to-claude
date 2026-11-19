@@ -109,8 +109,10 @@ There is no slash command. If a model does not call the tool, ask it to call
 Check the forward_to_claude status for this session.
 ```
 
-The tool returns `none`, `awaiting_translation`, or `ready` without changing
-files.
+The tool returns `none`, `awaiting_translation`, `ready`, `incomplete`, or
+`invalid` without changing files. `ready` requires a manifest with
+`status: "ready"` listing all four final artifacts as regular files; an
+incomplete or invalid latest bundle is not treated as finalized.
 
 ### Output
 
@@ -124,10 +126,12 @@ forward-to-claude/
       manifest.json
 ```
 
-During processing the folder also holds `SOURCE.md` and `BRIEF.json`. Both are
-removed only after the final artifacts are written, read back, and verified.
-`SOURCE.md` is allowed to contain the original text; it is staging, not part of
-the published bundle.
+During processing the folder also holds `SOURCE.md` and `BRIEF.json`. Finalize
+preflights the folder, writes `HANDOFF.md`, `REVIEW.md`, and `PROMPT.md`,
+verifies them, deletes staging, and publishes `manifest.json` last as the
+success marker. If a later step fails, finalize removes the published artifacts,
+restores `SOURCE.md` and `BRIEF.json`, and leaves the bundle
+`awaiting_translation` rather than claiming `ready`.
 
 Copy the fenced block from `PROMPT.md` into Claude. The prompt tells Claude to
 read `HANDOFF.md`, `REVIEW.md`, and `manifest.json`, reconstruct the project
@@ -208,21 +212,22 @@ No dependencies are required.
 
 ```bash
 npm test
-# equivalent:
-node --test --test-isolation=none tests/integration.mjs
+# direct fallback for the DSH Windows sandbox (test-runner child pipes denied):
+node tests/integration.mjs
 ```
 
-In normal environments the test-runner form may also be used:
-
-```bash
-node --test tests/integration.mjs
-```
+`npm test` is the portable Node.js >=22 command used by CI. The direct file
+invocation runs the identical suite in-process and is the supported fallback
+when the sandbox denies the test runner's child-process pipes.
 
 The suite covers the end-to-end start/finalize flow, junction containment,
 CJK/fullwidth handling, regional-trace categories, no-echo errors, scrub
 checklists, code-span exemption, traced session/cwd/file labels, T/M ledger
-coverage, alias drift, shared aliases, exact section/file labels, and
-fail-closed behavior. It writes only to fresh temporary directories.
+coverage, alias drift, shared aliases, exact section/file labels, fail-closed
+behavior, transactional preflight/rollback and manifest-last publishing, status
+manifest validation, same-second numeric suffix ordering, and file-symlink
+boundary checks. File-symlink cases skip only when the host denies symlink
+creation. It writes only to fresh temporary directories.
 
 ### Package layout
 

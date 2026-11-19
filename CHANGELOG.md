@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.1] - 2026-11-19
+
+Safety and portability fixes found in the 1.0.0 review.
+
+- Finalize is transactional: it preflights the handoff folder, writes
+  `HANDOFF.md`, `REVIEW.md`, and `PROMPT.md`, verifies them, deletes staging,
+  then publishes `manifest.json` last as the success marker. A failure after
+  writing rolls back the final artifacts, restores `SOURCE.md` and `BRIEF.json`,
+  and leaves status `awaiting_translation` instead of a false `ready`.
+- `status` validates the manifest and all four final artifacts. It reports
+  `ready` only for a parsed `status: "ready"` manifest listing all four regular
+  files, otherwise `awaiting_translation`, `incomplete`, or `invalid`. Finalize
+  refuses an incomplete/invalid latest bundle.
+- Unexpected entries and symlinked/non-regular bundle files are refused before
+  writes. `BRIEF.json`, `SOURCE.md`, `HANDOFF.md`, and `manifest.json` reads go
+  through an lstat/realpath boundary check that refuses symlinks and escapes.
+- Same-second handoff folders sort by numeric suffix (`-10` is newer than
+  `-9`), with the unsuffixed form treated as suffix 0.
+- `npm test` now runs `node --test tests/integration.mjs`, compatible with the
+  declared Node.js >=22 engine range. Docs record `node tests/integration.mjs`
+  as the direct fallback for the DSH Windows sandbox.
+- Added regressions for extra drafts, manifest-last publishing, rollback,
+  status validation, numeric ordering, file symlinks, and the package
+  test/engine contract.
+
 ## [1.0.0] - 2026-11-19
 
 Initial public release.

@@ -123,9 +123,18 @@ The agent writes the result to `HANDOFF.md` or passes it as
 
 ### 3. finalize
 
-`finalize` locates the newest `handoff-*` folder for the session (by descending
-folder name). Before writing anything it validates all in-memory artifact
-strings and planned names:
+`finalize` locates the newest `handoff-*` folder for the session by timestamp and
+then numeric duplicate suffix (`-10` is newer than `-9`; the unsuffixed form is
+suffix 0). It first preflights the folder: only `SOURCE.md`, `BRIEF.json`,
+`HANDOFF.md`, `REVIEW.md`, `PROMPT.md`, and `manifest.json` may exist, and known
+files must be regular files, not symlinks. An unexpected entry fails before any
+final artifact is written, with staging untouched. `BRIEF.json`, `SOURCE.md`,
+`HANDOFF.md`, and `manifest.json` are read through an lstat/realpath boundary
+check that refuses symlinks, non-regular files, and paths outside the bundle or
+working directory.
+
+Before writing anything it validates all in-memory artifact strings and planned
+names:
 
 - every `BRIEF.json` section id appears as a Markdown heading matching
   `^#{1,6}\s*\[S#\]`, and the heading carries the exact source section label
@@ -160,13 +169,27 @@ reported by line number and neutral category only, and no final artifact is
 written when the gate fails. `SOURCE.md` and `BRIEF.json` remain so the agent
 can fix the translation or scrub and call finalize again.
 
-On success the tool writes `HANDOFF.md` when it was supplied, then `REVIEW.md`,
-`PROMPT.md`, and `manifest.json`, reads every artifact back to verify content
-and name, deletes the two staging files only after that verification, and
-recursively verifies that the folder has no CJK or regional trace in any file
-name or content. The returned value contains the ready folder, the four file
-names, the message "The English handoff bundle is ready at ...", and the
-ready-to-paste prompt.
+On success the tool writes `HANDOFF.md` when it was supplied, then `REVIEW.md`
+and `PROMPT.md`; reads them back to verify content; runs the recursive
+CJK/regional-trace scan before deleting staging (ignoring `SOURCE.md` and
+`BRIEF.json`); deletes the two staging files; writes and verifies
+`manifest.json` last as the success marker; and runs the full recursive scan
+again. The returned value contains the ready folder, the four file names, the
+message "The English handoff bundle is ready at ...", and the ready-to-paste
+prompt.
+
+If writing or verifying `HANDOFF.md`, `REVIEW.md`, or `PROMPT.md` fails before
+staging deletion, finalize removes the written final artifacts and keeps
+staging. If staging deletion, manifest publication/verification, or the final
+scan fails, it removes the published artifacts, restores `SOURCE.md` and
+`BRIEF.json` from the captured text, and leaves the bundle
+`awaiting_translation` rather than returning a false `ready`.
+
+Rollback is exercised deterministically through an optional Host-context
+test seam: `ctx.forwardToClaudeTestHooks.beforeManifest({ folder })` and
+`ctx.forwardToClaudeTestHooks.afterManifest({ folder })` are called only when
+provided by the test harness. They are not a public tool parameter and have no
+effect in normal use.
 
 `manifest.json` records the version, `ready` status, creation time, neutral
 session segment, a trace-free `folder` reference, source section count and
@@ -181,10 +204,14 @@ message, and the start/status results use the trace-free relative path instead.
 
 ### 4. status
 
-`status` reports `ready`, `awaiting_translation`, or `none` for the newest
-bundle of this session, with its folder and files. It never writes, renames,
-or deletes anything. Traced file names and folder paths are neutralized in the
-response.
+`status` reports `ready`, `awaiting_translation`, `incomplete`, `invalid`, or
+`none` for the newest bundle of this session, with its folder and files. It
+never writes, renames, or deletes anything. `ready` is returned only when
+`manifest.json` exists, parses, has `status: "ready"`, lists all four final
+artifacts, and all four are regular files. A brief without a manifest is
+`awaiting_translation`; a missing manifest/artifact or absent staging is
+`incomplete`; a malformed or unsafe manifest is `invalid`. Traced file names and
+folder paths are neutralized in the response.
 
 ## Regional-trace scanner
 
@@ -354,7 +381,7 @@ spec can be used after the repository is published.
 
 ## Test
 
-The automated suite at `tests/integration.mjs` has twenty-five test cases: the
+The automated suite at `tests/integration.mjs` has thirty-eight test cases: the
 end-to-end `start`/`finalize` path; negative finalize cases (false review
 placeholders, dropped section, injected CJK from every covered block,
 dishonest review, missing handoff); a skipped-answer case; loud-failure cases;
@@ -374,13 +401,22 @@ file-token refusals, T-row and sections_reviewed coverage, removed rows, M-row
 validation and acceptance, consistency-required/flag/notes validation, a
 complete T+M audit publishing the REVIEW table and manifest summary, and a
 red->green shared-alias regression where two distinct T rows share one
-structured alias for one entity and publish under it. The junction cases skip
-only when the OS denies junction creation. Run:
+structured alias for one entity and publish under it; transactional finalize
+preflight/rollback/manifest-last; status incomplete/invalid/ready validation;
+eleven same-second numeric-suffix ordering; timestamp and unsuffixed-suffix
+ordering; and file-symlink boundary cases that skip only when the OS denies file
+symlinks. The package test/engine contract is asserted as well. The junction
+cases skip only when the OS denies junction creation. Run:
 
 ```
 node --test tests/integration.mjs
 ```
 
-The suite writes only to fresh temporary directories by default. In sandboxed
-environments that deny child-process pipes, use
-`node --test --test-isolation=none tests/integration.mjs`.
+The suite writes only to fresh temporary directories by default. `npm test` uses
+the portable `node --test tests/integration.mjs` command on the declared
+Node.js >=22 range; CI runs it on Node 22 and 24. In the DSH Windows sandbox,
+where test-runner child-process pipes are denied, the supported fallback is:
+
+```
+node tests/integration.mjs
+```

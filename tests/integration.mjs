@@ -21,7 +21,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, readdir, realpath, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -47,6 +47,7 @@ const OPTION_FILES = 'Text files from this project'
 const OPTION_NOTE = 'A handoff note I write now'
 const SESSION_ID = 'session-test-001'
 const JUNCTION_UNAVAILABLE = new Set(['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL', 'UNKNOWN'])
+const FILE_SYMLINK_UNAVAILABLE = new Set(['EPERM', 'EACCES', 'ENOTSUP'])
 
 const FILE_TEXT = '# 项目笔记\n\n运行 `npm run build` 生成产物。\n\n配置位于 `config/app.json`。\n'
 const CJK_NAME_DIR = '资料'
@@ -117,10 +118,10 @@ const FIXTURE_CONVERSATION = [
 
 /**
  * Build a stubbed Host context and execute one `apply(ctx)`.
- * @param {{ cwd: string, answers: object[][], messages: object[], sessionId?: string, visible?: boolean }} options - Fixtures.
+ * @param {{ cwd: string, answers: object[][], messages: object[], sessionId?: string, visible?: boolean, clock?: object, forwardTestHooks?: object }} options - Fixtures.
  * @returns {object} Harness handles.
  */
-function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible = true }) {
+function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible = true, clock, forwardTestHooks }) {
   const definitions = []
   const sections = []
   const asks = []
@@ -136,6 +137,8 @@ function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible
     signal: new AbortController().signal,
   }
   const ctx = {
+    clock,
+    forwardToClaudeTestHooks: forwardTestHooks,
     effect(callback) {
       const cleanup = callback()
       effects.push(cleanup)
@@ -240,13 +243,55 @@ async function assertStagedOnly(folder) {
  * @param {{ cwd: string, noteText?: string, sessionId?: string }} options - Fixture.
  * @returns {Promise<object>} Harness, start result, folder, and brief.
  */
-async function startNoteBundle({ cwd, noteText = 'handoff note', sessionId = SESSION_ID }) {
-  const harness = createHarness({ cwd, answers: noteOnlyAnswers(noteText), messages: [], sessionId })
+async function startNoteBundle({ cwd, noteText = 'handoff note', sessionId = SESSION_ID, clock, forwardTestHooks }) {
+  const harness = createHarness({ cwd, answers: noteOnlyAnswers(noteText), messages: [], sessionId, clock, forwardTestHooks })
   const definition = harness.definitions[0]
   const started = await definition.execute({ action: 'start' }, harness.exec)
   const folder = fromCwd(started.folder, cwd)
   const brief = JSON.parse(await readFile(join(folder, 'BRIEF.json'), 'utf8'))
   return { harness, definition, started, folder, brief }
+}
+
+/**
+ * Start a note-only bundle and finalize it with the standard clean fixtures.
+ * @param {{ cwd?: string, noteText?: string, forwardTestHooks?: object }} options - Fixture.
+ * @returns {Promise<object>} Harness, definition, brief, folder, start result, finalize result.
+ */
+async function finalizeNoteBundle(options = {}) {
+  const cwd = options.cwd ?? await makeCwd()
+  const { harness, definition, started, folder, brief } = await startNoteBundle({
+    cwd,
+    noteText: options.noteText ?? 'clean handoff note',
+    forwardTestHooks: options.forwardTestHooks,
+  })
+  const ready = await definition.execute({
+    action: 'finalize',
+    handoff_markdown: buildEnglishHandoff(brief),
+    review: buildReviewRows(brief),
+    scrub: cleanScrub(),
+    consistency: buildConsistency(brief),
+  }, harness.exec)
+  return { cwd, harness, definition, started, folder, brief, ready }
+}
+
+/**
+ * Create a file symlink, or skip the calling test when the OS denies it.
+ * @param {object} t - node:test context.
+ * @param {string} target - Symlink target.
+ * @param {string} linkPath - Symlink path.
+ * @returns {Promise<boolean>} True when created.
+ */
+async function createFileSymlinkOrSkip(t, target, linkPath) {
+  try {
+    await symlink(target, linkPath, 'file')
+    return true
+  } catch (error) {
+    if (FILE_SYMLINK_UNAVAILABLE.has(error?.code)) {
+      t.skip(`file symlink creation is unavailable on this host: ${error.code}`)
+      return false
+    }
+    throw error
+  }
 }
 
 /**
@@ -354,6 +399,17 @@ function cleanScrub(overrides = {}) {
     political_cultural_references_replaced: true,
     notes: 'Regional identifying details were replaced with neutral aliases; no mapping was retained.',
     ...overrides,
+  }
+}
+
+/** Build one complete positive finalize call for a brief. */
+function finalizeArgs(brief) {
+  return {
+    action: 'finalize',
+    handoff_markdown: buildEnglishHandoff(brief),
+    review: buildReviewRows(brief),
+    scrub: cleanScrub(),
+    consistency: buildConsistency(brief),
   }
 }
 
@@ -1866,4 +1922,253 @@ test('two distinct trace rows may share one structured alias for the same entity
   assert.equal(manifest.consistency.aliased, 2)
   assert.equal(manifest.consistency.removed, 0)
   assertNoKnownTrace(await readFile(join(folder, 'manifest.json'), 'utf8'), 'shared-alias manifest.json')
+})
+
+test('an unexpected draft in the staging folder is refused before any final artifact', async () => {
+  const cwd = await makeCwd()
+  const { harness, definition, folder, brief } = await startNoteBundle({ cwd })
+  await writeFile(join(folder, 'draft-中文.md'), 'unexpected draft\n', 'utf8')
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /unexpected entry/i,
+  )
+  assert.deepEqual((await readdir(folder)).sort(), ['BRIEF.json', 'SOURCE.md', 'draft-中文.md'])
+  assert.equal(await exists(join(folder, 'HANDOFF.md')), false)
+  assert.equal(await exists(join(folder, 'REVIEW.md')), false)
+  assert.equal(await exists(join(folder, 'PROMPT.md')), false)
+  assert.equal(await exists(join(folder, 'manifest.json')), false)
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'awaiting_translation')
+})
+
+test('successful finalize publishes manifest.json last and status validates it', async () => {
+  const seen = []
+  const cwd = await makeCwd()
+  const { harness, definition, folder, brief } = await startNoteBundle({
+    cwd,
+    forwardTestHooks: {
+      beforeManifest: async ({ folder: current }) => {
+        seen.push((await readdir(current)).sort())
+      },
+    },
+  })
+  const ready = await definition.execute(finalizeArgs(brief), harness.exec)
+  assert.equal(ready.status, 'ready')
+  assert.deepEqual(seen, [['HANDOFF.md', 'PROMPT.md', 'REVIEW.md']], 'staging must be gone and manifest absent before manifest is written')
+  assert.deepEqual((await readdir(folder)).sort(), ['HANDOFF.md', 'PROMPT.md', 'REVIEW.md', 'manifest.json'])
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'ready')
+  assert.deepEqual(status.files, ['HANDOFF.md', 'PROMPT.md', 'REVIEW.md', 'manifest.json'])
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /already finalized/i,
+  )
+})
+
+test('manifest removal makes status incomplete and finalize refuses the latest bundle', async () => {
+  const { harness, definition, folder, brief } = await finalizeNoteBundle()
+  await rm(join(folder, 'manifest.json'))
+  const incomplete = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(incomplete.status, 'incomplete')
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /latest handoff bundle is incomplete/i,
+  )
+  await writeFile(join(folder, 'manifest.json'), '{ this is not json\n', 'utf8')
+  const invalid = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(invalid.status, 'invalid')
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /latest handoff bundle has an invalid manifest/i,
+  )
+})
+
+test('a post-manifest failure rolls back all final artifacts and restores staging', async () => {
+  const cwd = await makeCwd()
+  const { harness, definition, folder, brief } = await startNoteBundle({
+    cwd,
+    forwardTestHooks: {
+      afterManifest: async () => {
+        throw new Error('injected publish failure')
+      },
+    },
+  })
+  const sourceBefore = await readFile(join(folder, 'SOURCE.md'), 'utf8')
+  const briefBefore = await readFile(join(folder, 'BRIEF.json'), 'utf8')
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /rolled back|awaiting_translation/,
+  )
+  assert.deepEqual((await readdir(folder)).sort(), ['BRIEF.json', 'SOURCE.md'])
+  assert.equal(await exists(join(folder, 'HANDOFF.md')), false)
+  assert.equal(await exists(join(folder, 'REVIEW.md')), false)
+  assert.equal(await exists(join(folder, 'PROMPT.md')), false)
+  assert.equal(await exists(join(folder, 'manifest.json')), false)
+  assert.equal(await readFile(join(folder, 'SOURCE.md'), 'utf8'), sourceBefore)
+  assert.equal(await readFile(join(folder, 'BRIEF.json'), 'utf8'), briefBefore)
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'awaiting_translation')
+})
+
+test('a failing final scan rolls back and restores staging without claiming ready', async () => {
+  const cwd = await makeCwd()
+  const { harness, definition, folder, brief } = await startNoteBundle({
+    cwd,
+    forwardTestHooks: {
+      afterManifest: async ({ folder: current }) => {
+        await writeFile(join(current, 'late-中文.md'), 'late draft\n', 'utf8')
+      },
+    },
+  })
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /rolled back|awaiting_translation/,
+  )
+  assert.equal(await exists(join(folder, 'SOURCE.md')), true)
+  assert.equal(await exists(join(folder, 'BRIEF.json')), true)
+  assert.equal(await exists(join(folder, 'HANDOFF.md')), false)
+  assert.equal(await exists(join(folder, 'REVIEW.md')), false)
+  assert.equal(await exists(join(folder, 'PROMPT.md')), false)
+  assert.equal(await exists(join(folder, 'manifest.json')), false)
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'awaiting_translation')
+})
+
+test('a ready manifest with a missing artifact is incomplete and finalize refuses it', async () => {
+  const { harness, definition, folder, brief } = await finalizeNoteBundle()
+  await rm(join(folder, 'HANDOFF.md'))
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'incomplete')
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /latest handoff bundle is incomplete/i,
+  )
+})
+
+test('an empty latest bundle is incomplete and cannot be finalized', async () => {
+  const cwd = await makeCwd()
+  const sessionDir = join(cwd, 'forward-to-claude', SESSION_ID)
+  await mkdir(sessionDir, { recursive: true })
+  await mkdir(join(sessionDir, 'handoff-20261119-120000'))
+  const harness = createHarness({ cwd, answers: [], messages: [] })
+  const definition = harness.definitions[0]
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'incomplete')
+  await assert.rejects(
+    definition.execute({ action: 'finalize' }, harness.exec),
+    /latest handoff bundle is incomplete/i,
+  )
+})
+
+test('eleven same-second starts sort by numeric suffix and select -10', async () => {
+  const cwd = await makeCwd()
+  const fixed = new Date('2026-11-19T12:00:00Z')
+  const answers = Array.from({ length: 11 }, () => noteOnlyAnswers('same-second note')).flat()
+  const harness = createHarness({ cwd, answers, messages: [], clock: { now: () => fixed } })
+  const definition = harness.definitions[0]
+  for (let index = 0; index < 11; index += 1) {
+    await definition.execute({ action: 'start' }, harness.exec)
+  }
+  const sessionDir = join(cwd, 'forward-to-claude', SESSION_ID)
+  const names = (await readdir(sessionDir)).sort()
+  assert.deepEqual(names, [
+    'handoff-20261119-120000',
+    ...Array.from({ length: 10 }, (_, index) => `handoff-20261119-120000-${index + 1}`),
+  ].sort())
+  const selected = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(basename(fromCwd(selected.folder, cwd)), 'handoff-20261119-120000-10')
+  assert.equal(selected.status, 'awaiting_translation')
+  const latestBrief = JSON.parse(await readFile(join(sessionDir, 'handoff-20261119-120000-10', 'BRIEF.json'), 'utf8'))
+  const ready = await definition.execute(finalizeArgs(latestBrief), harness.exec)
+  assert.equal(ready.status, 'ready')
+  assert.equal(basename(fromCwd(ready.folder, cwd)), 'handoff-20261119-120000-10')
+  const after = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(after.status, 'ready')
+  assert.equal(basename(fromCwd(after.folder, cwd)), 'handoff-20261119-120000-10')
+})
+
+test('timestamp ordering and the unsuffixed default-0 suffix are both respected', async () => {
+  const cwd = await makeCwd()
+  let now = new Date('2026-11-19T12:00:00Z')
+  const harness = createHarness({
+    cwd,
+    answers: Array.from({ length: 3 }, () => noteOnlyAnswers('ordering note')).flat(),
+    messages: [],
+    clock: { now: () => now },
+  })
+  const definition = harness.definitions[0]
+  await definition.execute({ action: 'start' }, harness.exec)
+  await definition.execute({ action: 'start' }, harness.exec)
+  const suffixed = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(basename(fromCwd(suffixed.folder, cwd)), 'handoff-20261119-120000-1')
+  now = new Date('2026-11-19T12:00:01Z')
+  await definition.execute({ action: 'start' }, harness.exec)
+  const newer = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(basename(fromCwd(newer.folder, cwd)), 'handoff-20261119-120001')
+})
+
+test('symlinked HANDOFF.md is refused before writes and its target is untouched', async (t) => {
+  const cwd = await makeCwd()
+  const outside = await makeOutsideDir()
+  const target = join(outside, 'outside-handoff.md')
+  await writeFile(target, 'outside draft content\n', 'utf8')
+  const { harness, definition, folder, brief } = await startNoteBundle({ cwd })
+  if (!await createFileSymlinkOrSkip(t, target, join(folder, 'HANDOFF.md'))) return
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /symlink|non-regular/i,
+  )
+  assert.equal(await readFile(target, 'utf8'), 'outside draft content\n')
+  assert.equal(await exists(join(folder, 'REVIEW.md')), false)
+  assert.equal(await exists(join(folder, 'PROMPT.md')), false)
+  assert.equal(await exists(join(folder, 'manifest.json')), false)
+})
+
+test('symlinked BRIEF.json is refused and leaves staging intact', async (t) => {
+  const cwd = await makeCwd()
+  const outside = await makeOutsideDir()
+  const target = join(outside, 'outside-brief.json')
+  const { harness, definition, folder, brief } = await startNoteBundle({ cwd })
+  const originalBrief = await readFile(join(folder, 'BRIEF.json'), 'utf8')
+  await writeFile(target, originalBrief, 'utf8')
+  await rm(join(folder, 'BRIEF.json'))
+  if (!await createFileSymlinkOrSkip(t, target, join(folder, 'BRIEF.json'))) return
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /symlink|non-regular/i,
+  )
+  assert.equal(await exists(join(folder, 'SOURCE.md')), true)
+  assert.equal(await exists(join(folder, 'REVIEW.md')), false)
+  assert.equal(await exists(join(folder, 'PROMPT.md')), false)
+  assert.equal(await exists(join(folder, 'manifest.json')), false)
+  assert.equal(await readFile(target, 'utf8'), originalBrief)
+})
+
+test('symlinked manifest.json makes status invalid and finalize refuses it', async (t) => {
+  const cwd = await makeCwd()
+  const outside = await makeOutsideDir()
+  const { harness, definition, folder, brief } = await finalizeNoteBundle({ cwd })
+  const target = join(outside, 'outside-manifest.json')
+  await writeFile(target, await readFile(join(folder, 'manifest.json'), 'utf8'), 'utf8')
+  await rm(join(folder, 'manifest.json'))
+  if (!await createFileSymlinkOrSkip(t, target, join(folder, 'manifest.json'))) return
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'invalid')
+  await assert.rejects(
+    definition.execute(finalizeArgs(brief), harness.exec),
+    /symlink|non-regular/i,
+  )
+  assert.equal(await exists(target), true)
+})
+
+test('package test script and Node engine range are portable', async () => {
+  const packageJson = JSON.parse(await readFile(join(PACKAGE_DIR, 'package.json'), 'utf8'))
+  assert.equal(packageJson.version, '1.0.1')
+  assert.equal(packageJson.scripts.test, 'node --test tests/integration.mjs')
+  assert.equal(packageJson.engines.node, '>=22.0.0')
+  const workflow = await readFile(join(PACKAGE_DIR, '.github', 'workflows', 'ci.yml'), 'utf8')
+  assert.match(workflow, /'22'/)
+  assert.match(workflow, /'24'/)
+  const changelog = await readFile(join(PACKAGE_DIR, 'CHANGELOG.md'), 'utf8')
+  assert.match(changelog, /## \[1\.0\.1\]/)
 })

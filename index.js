@@ -20,7 +20,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, lstat, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 /** Plugin (Cordis row) name. */
@@ -52,6 +52,12 @@ const MAX_PROBLEMS = 20
 
 /** Artifacts written by a successful finalize. */
 const FINAL_ARTIFACTS = ['HANDOFF.md', 'REVIEW.md', 'PROMPT.md', 'manifest.json']
+
+/** Staging and final entries a handoff folder may contain. */
+const BUNDLE_ENTRIES = new Set(['SOURCE.md', 'BRIEF.json', ...FINAL_ARTIFACTS])
+
+/** Handoff folder name: timestamp plus optional numeric duplicate suffix. */
+const HANDOFF_NAME_PATTERN = /^handoff-(\d{8}-\d{6})(?:-(\d+))?$/
 
 /**
  * One CJK/fullwidth scan used by every gate in this plugin.
@@ -673,7 +679,7 @@ function toolDefinition(ctx) {
       + 'the tool creates <cwd>/forward-to-claude/<session-id>/handoff-<timestamp>/, writes a staging file SOURCE.md that may contain Chinese, and returns translation instructions, a section summary, a trace-free T ledger, a review template, a required regional-trace scrub template, and a required consistency template. '
       + '(2) Translate every section of SOURCE.md fully and faithfully into natural technical English, replace every identifying regional detail (country/region, city/region, organization/platform, domain/contact, currency/unit, locale/language, political/cultural, and personal-name categories) with a neutral alias, keep [S#] headings with exact source labels and every safe code identifier/command/path/number, then call with action "finalize" with one review row per section, a completed scrub checklist, and a completed consistency audit: '
       + 'the tool mechanically verifies section coverage, exact section/file labels, inline code spans, review completeness, scrub completeness, ledger coverage and alias consistency, the absence of every CJK/fullwidth character, and the absence of known high-confidence regional traces; it reports neutral category ids and line numbers only, never repeating matched terms. '
-      + 'Finalize refuses missing, false, empty-notes, or trace-bearing scrub/consistency attestations, alias drift, missing/extra ledger rows, undeclared alias-like tokens, or changed labels, and writes HANDOFF.md, REVIEW.md, PROMPT.md, and manifest.json before deleting the staging files and returning a ready-to-paste prompt. '
+      + 'Finalize refuses missing, false, empty-notes, or trace-bearing scrub/consistency attestations, alias drift, missing/extra ledger rows, undeclared alias-like tokens, or changed labels; on success it writes and verifies HANDOFF.md, REVIEW.md, and PROMPT.md, deletes the staging files, then writes manifest.json last as the ready marker and returns a ready-to-paste prompt. '
       + '(3) After translation and scrub, perform a separate whole-document consistency audit of HANDOFF.md: complete one row per T id from the ledger returned by start, add M1.. rows for any entity the scanner missed, and use only the shared structured alias grammar (Person A, Team member A, Vendor A, Platform A, City A, Region A, Currency A, File A, and similar) with exact source section labels and file labels; multiple T/M rows may share one structured alias only when they denote the same entity, and the notes must attest that. Finalize rejects alias drift, missing or extra T rows, undeclared alias-like tokens, and changed section/file labels. '
       + '(4) Use action "status" to inspect the latest bundle for this session without changing it. '
       + 'Use this tool only when the user wants to hand off or continue this session or project in Claude. It never contacts Claude and never sends data over a network.',
@@ -741,7 +747,7 @@ function toolDefinition(ctx) {
           action: { type: 'string', enum: ['start', 'finalize', 'status'], description: 'Action that produced this result.' },
           status: {
             type: 'string',
-            description: 'awaiting_translation, ready, none, or nothing_selected, depending on the action.',
+            description: 'awaiting_translation, ready, incomplete, invalid, none, or nothing_selected, depending on the action.',
           },
           folder: { type: 'string', description: 'Handoff folder path. Absolute when it is ASCII-only.' },
           source_path: { type: 'string', description: 'Path of the staging SOURCE.md written by start.' },
@@ -927,7 +933,7 @@ async function runStart(ctx, exec) {
   const traceLedger = buildTraceLedger(sections)
   const sourceText = renderSource(sections)
   const brief = buildBrief({ sessionId, sections, sourceText, files: fileRecords, regionalTraceSummary, traces: traceLedger })
-  const folder = await createHandoffFolder(cwd, realCwd, sessionId)
+  const folder = await createHandoffFolder(cwd, realCwd, sessionId, clockNow(ctx))
   const sourcePath = join(folder, 'SOURCE.md')
   await writeAtomic(sourcePath, sourceText)
   await writeJsonAtomic(join(folder, 'BRIEF.json'), brief, 'BRIEF.json')
@@ -1229,16 +1235,37 @@ async function runFinalize(ctx, exec, args) {
   if (latest === undefined) {
     throw new Error('No forward-to-claude handoff bundle exists for this session. Call forward_to_claude with action "start" first.')
   }
-  if (!latest.hasBrief) {
-    throw new Error('The latest handoff bundle is already finalized (status ready). Use action "status" to inspect it, or action "start" to create a new bundle.')
-  }
   const realCwd = await resolveRealPath(cwd, 'the session working directory')
   const realFolder = await resolveRealPath(latest.folder, 'the latest handoff folder')
   if (!isInside(realCwd, realFolder)) {
     throw new Error('The latest handoff folder resolves outside the session working directory, so it was not opened.')
   }
   const folder = latest.folder
-  const brief = await readBrief(folder)
+
+  // Preflight before any write: an unexpected entry, symlink, or non-regular
+  // known file must leave the staging files untouched.
+  await preflightHandoffFolder(folder, realFolder, realCwd)
+  const initialState = await inspectBundleState(folder, realFolder, realCwd)
+  if (initialState.status === 'ready') {
+    throw new Error('The latest handoff bundle is already finalized (status ready). Use action "status" to inspect it, or action "start" to create a new bundle.')
+  }
+  if (initialState.status === 'incomplete') {
+    throw new Error('The latest handoff bundle is incomplete, so finalize refused to treat it as ready. Create a new bundle with action "start" or repair the latest folder.')
+  }
+  if (initialState.status === 'invalid') {
+    throw new Error('The latest handoff bundle has an invalid manifest or unsafe bundle file, so finalize refused to treat it as ready. Create a new bundle with action "start" or repair the latest folder.')
+  }
+
+  // Capture staging text in memory before publishing. It is restored verbatim
+  // if a later publish step fails.
+  const sourceText = await readBundleFile(folder, realFolder, realCwd, 'SOURCE.md')
+  const briefText = await readBundleFile(folder, realFolder, realCwd, 'BRIEF.json')
+  const brief = parseBriefText(briefText)
+
+  const handoffInfo = await bundleFileInfo(folder, realFolder, realCwd, 'HANDOFF.md')
+  const existingHandoff = handoffInfo.exists
+    ? await readBundleFile(folder, realFolder, realCwd, 'HANDOFF.md')
+    : null
 
   const supplied = typeof args?.handoff_markdown === 'string' ? args.handoff_markdown : ''
   let handoff
@@ -1247,14 +1274,10 @@ async function runFinalize(ctx, exec, args) {
     handoff = supplied
     writeHandoff = true
   } else {
-    try {
-      handoff = await readFile(join(folder, 'HANDOFF.md'), 'utf8')
-    } catch (error) {
-      if (error?.code === 'ENOENT') {
-        throw new Error('No English handoff was provided. Pass the complete text as handoff_markdown, or write it to HANDOFF.md inside the handoff folder first.')
-      }
-      throw new Error('HANDOFF.md could not be read. Check the file and call action "finalize" again.', { cause: error })
+    if (existingHandoff === null) {
+      throw new Error('No English handoff was provided. Pass the complete text as handoff_markdown, or write it to HANDOFF.md inside the handoff folder first.')
     }
+    handoff = existingHandoff
     if (handoff.trim() === '') {
       throw new Error('HANDOFF.md is empty. Write the complete English handoff text and call action "finalize" again.')
     }
@@ -1274,13 +1297,13 @@ async function runFinalize(ctx, exec, args) {
 
   // Fail closed: validate every in-memory artifact string and planned name
   // before any final artifact is written.
-  const plannedArtifacts = [
+  const writtenArtifacts = [
     ['HANDOFF.md', handoff],
     ['REVIEW.md', reviewText],
     ['PROMPT.md', promptDocument],
     ['manifest.json', manifestText],
   ]
-  for (const [artifactName, artifactText] of plannedArtifacts) {
+  for (const [artifactName, artifactText] of writtenArtifacts) {
     assertArtifactTraceFree(artifactName, artifactText)
   }
   if (/[^\x00-\x7F]/.test(manifestText)) {
@@ -1295,30 +1318,88 @@ async function runFinalize(ctx, exec, args) {
     }
   }
 
-  if (writeHandoff) await writeAtomic(join(folder, 'HANDOFF.md'), handoff)
-  await writeAtomic(join(folder, 'REVIEW.md'), reviewText)
-  await writeAtomic(join(folder, 'PROMPT.md'), promptDocument)
-  await writeAtomic(join(folder, 'manifest.json'), manifestText)
-
-  // Verify the artifacts actually written and their names before removing the
-  // staging files. A failure here leaves SOURCE.md and BRIEF.json in place.
-  for (const [artifactName, expected] of plannedArtifacts) {
-    let actual
-    try {
-      actual = await readFile(join(folder, artifactName), 'utf8')
-    } catch (error) {
-      throw new Error(`Could not verify ${artifactName} after writing it, so the staging files were kept for retry.`, { cause: error })
+  const published = new Set()
+  const cleanupPublishedArtifacts = async () => {
+    for (const artifactName of FINAL_ARTIFACTS) {
+      if (!published.has(artifactName)) continue
+      await rm(join(folder, artifactName), { force: true }).catch(() => {})
     }
-    if (actual !== expected) {
-      throw new Error(`The written ${artifactName} did not match the verified content, so the staging files were kept for retry.`)
+  }
+  const restoreHandoffDraft = async () => {
+    if (writeHandoff) {
+      if (existingHandoff !== null) {
+        await writeAtomic(join(folder, 'HANDOFF.md'), existingHandoff).catch(() => {})
+      } else {
+        await rm(join(folder, 'HANDOFF.md'), { force: true }).catch(() => {})
+      }
     }
-    assertArtifactTraceFree(artifactName, actual)
+  }
+  const restoreStaging = async () => {
+    await writeAtomic(join(folder, 'SOURCE.md'), sourceText)
+    await writeAtomic(join(folder, 'BRIEF.json'), briefText)
+  }
+  const rollbackBeforeStaging = async (message, cause) => {
+    await cleanupPublishedArtifacts()
+    await restoreHandoffDraft()
+    throw new Error(`${message} SOURCE.md and BRIEF.json were kept for retry; no final artifact was published.`, { cause })
   }
 
-  // Staging is deleted only after every planned artifact was verified.
-  await rm(join(folder, 'SOURCE.md'), { force: true })
-  await rm(join(folder, 'BRIEF.json'), { force: true })
-  await verifyFinalFolder(folder)
+  // Write only the non-manifest artifacts first. Verify them, then run the
+  // final folder scan before deleting staging. Manifest is published last.
+  try {
+    if (writeHandoff) {
+      await writeAtomic(join(folder, 'HANDOFF.md'), handoff)
+      published.add('HANDOFF.md')
+    }
+    await writeAtomic(join(folder, 'REVIEW.md'), reviewText)
+    published.add('REVIEW.md')
+    await writeAtomic(join(folder, 'PROMPT.md'), promptDocument)
+    published.add('PROMPT.md')
+    for (const [artifactName, expected] of writtenArtifacts.slice(0, 3)) {
+      const actual = await readBundleFile(folder, realFolder, realCwd, artifactName)
+      if (actual !== expected) throw new Error(`The written ${artifactName} did not match the verified content.`)
+      assertArtifactTraceFree(artifactName, actual)
+    }
+    await verifyFinalFolder(folder, { skip: new Set(['SOURCE.md', 'BRIEF.json']) })
+  } catch (error) {
+    await rollbackBeforeStaging('Could not publish the final artifacts safely.', error)
+  }
+
+  try {
+    await rm(join(folder, 'SOURCE.md'), { force: true })
+    await rm(join(folder, 'BRIEF.json'), { force: true })
+  } catch (error) {
+    await cleanupPublishedArtifacts()
+    await restoreHandoffDraft()
+    await restoreStaging().catch(() => {})
+    throw new Error('Could not delete the staging files, so finalize rolled back and kept the bundle awaiting translation. Check permissions and try again.', { cause: error })
+  }
+
+  // manifest.json is the success marker: write and verify it last, then rescan
+  // the whole published folder. Any failure here restores staging verbatim.
+  try {
+    await ctx?.forwardToClaudeTestHooks?.beforeManifest?.({ folder })
+    await writeAtomic(join(folder, 'manifest.json'), manifestText)
+    published.add('manifest.json')
+    const actualManifest = await readBundleFile(folder, realFolder, realCwd, 'manifest.json')
+    if (actualManifest !== manifestText) throw new Error('The written manifest.json did not match the verified content.')
+    assertArtifactTraceFree('manifest.json', actualManifest)
+    await ctx?.forwardToClaudeTestHooks?.afterManifest?.({ folder })
+    await verifyFinalFolder(folder)
+  } catch (error) {
+    await cleanupPublishedArtifacts()
+    await restoreHandoffDraft()
+    let restoreFailed = false
+    try {
+      await restoreStaging()
+    } catch {
+      restoreFailed = true
+    }
+    const suffix = restoreFailed
+      ? ' The staging files could not be fully restored; inspect the folder before retrying.'
+      : ' SOURCE.md and BRIEF.json were restored and the bundle status is awaiting_translation, not ready.'
+    throw new Error(`The handoff could not be published safely, so finalize rolled back.${suffix}`, { cause: error })
+  }
 
   return {
     ok: true,
@@ -1350,17 +1431,11 @@ function assertArtifactTraceFree(artifactName, artifactText) {
 }
 
 /**
- * Read and shape-check BRIEF.json in one handoff folder.
- * @param {string} folder - Handoff folder.
- * @returns {Promise<object>} Parsed brief.
+ * Validate and shape-check parsed BRIEF.json text.
+ * @param {string} text - UTF-8 brief text.
+ * @returns {object} Parsed brief.
  */
-async function readBrief(folder) {
-  let text
-  try {
-    text = await readFile(join(folder, 'BRIEF.json'), 'utf8')
-  } catch (error) {
-    throw new Error('BRIEF.json could not be read from the latest handoff folder. The staging folder may be damaged; call action "start" to create a new bundle.', { cause: error })
-  }
+function parseBriefText(text) {
   let brief
   try {
     brief = JSON.parse(text)
@@ -1874,7 +1949,18 @@ async function runStatus(ctx, exec) {
     .map((entry, index) => (hasCjk(entry.name) || hasRegionalTrace(entry.name) || !isAsciiText(entry.name) ? `file-${index + 1}` : entry.name))
     .sort()
   const folder = folderReference(latest.folder, cwd).path
-  if (latest.hasBrief) {
+  const state = await inspectBundleState(latest.folder, realFolder, realCwd)
+  if (state.status === 'ready') {
+    return {
+      ok: true,
+      action: 'status',
+      status: 'ready',
+      folder,
+      files,
+      message: 'The latest handoff bundle is ready: manifest.json is valid and HANDOFF.md, REVIEW.md, PROMPT.md, and manifest.json are all present as regular files.',
+    }
+  }
+  if (state.status === 'awaiting_translation') {
     return {
       ok: true,
       action: 'status',
@@ -1884,13 +1970,23 @@ async function runStatus(ctx, exec) {
       message: 'The latest handoff bundle is still waiting for an English translation. SOURCE.md and BRIEF.json are present.',
     }
   }
+  if (state.status === 'invalid') {
+    return {
+      ok: true,
+      action: 'status',
+      status: 'invalid',
+      folder,
+      files,
+      message: 'The latest handoff bundle has a malformed or invalid manifest, or an unsafe bundle file. It is not ready.',
+    }
+  }
   return {
     ok: true,
     action: 'status',
-    status: 'ready',
+    status: 'incomplete',
     folder,
     files,
-    message: 'The latest handoff bundle is ready: HANDOFF.md, REVIEW.md, PROMPT.md, and manifest.json are present.',
+    message: 'The latest handoff bundle is incomplete: a ready manifest or the expected staging files are missing. It is not ready.',
   }
 }
 
@@ -1899,10 +1995,23 @@ async function runStatus(ctx, exec) {
 /* ------------------------------------------------------------------ */
 
 /**
- * List handoff folders for one session, newest first by folder name.
+ * Parse a handoff folder name into its timestamp and numeric suffix.
+ * The unsuffixed form sorts as suffix 0.
+ * @param {string} name - Directory name.
+ * @returns {{ stamp: string, suffix: number } | undefined} Parsed name.
+ */
+function parseHandoffName(name) {
+  const match = HANDOFF_NAME_PATTERN.exec(name)
+  if (match === null) return undefined
+  return { stamp: match[1], suffix: match[2] === undefined ? 0 : Number(match[2]) }
+}
+
+/**
+ * List handoff folders for one session, newest first by timestamp and then by
+ * numeric duplicate suffix (so -10 is newer than -9).
  * @param {string} cwd - Session working directory.
  * @param {string} sessionId - Sanitized session id.
- * @returns {Promise<Array<{ folder: string, name: string, hasBrief: boolean, hasManifest: boolean }>>} Bundles.
+ * @returns {Promise<{ folder: string, name: string, stamp: string, suffix: number } | undefined>} Latest bundle.
  */
 async function findLatestBundle(cwd, sessionId) {
   const sessionDir = join(cwd, HANDOFF_ROOT, sessionId)
@@ -1915,15 +2024,165 @@ async function findLatestBundle(cwd, sessionId) {
   }
   const bundles = []
   for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith('handoff-')) continue
-    const folder = join(sessionDir, entry.name)
-    const hasBrief = await fileExists(join(folder, 'BRIEF.json'))
-    const hasManifest = await fileExists(join(folder, 'manifest.json'))
-    if (!hasBrief && !hasManifest) continue
-    bundles.push({ folder, name: entry.name, hasBrief, hasManifest })
+    if (!entry.isDirectory()) continue
+    const parsed = parseHandoffName(entry.name)
+    if (parsed === undefined) continue
+    bundles.push({ folder: join(sessionDir, entry.name), name: entry.name, ...parsed })
   }
-  bundles.sort((left, right) => (left.name < right.name ? 1 : left.name > right.name ? -1 : 0))
+  bundles.sort((left, right) => {
+    if (left.stamp !== right.stamp) return left.stamp < right.stamp ? 1 : -1
+    return right.suffix - left.suffix
+  })
   return bundles[0]
+}
+
+/**
+ * Inspect one named bundle file without following symlinks. The returned real
+ * path is proved inside both the bundle folder and the session working
+ * directory before a caller reads it.
+ * @param {string} folder - Handoff folder path.
+ * @param {string} realFolder - Real handoff folder path.
+ * @param {string} realCwd - Real session working directory.
+ * @param {string} fileName - Fixed bundle file name.
+ * @returns {Promise<{ exists: boolean, regular?: boolean, symlink?: boolean, real?: string }>} File facts.
+ */
+async function bundleFileInfo(folder, realFolder, realCwd, fileName) {
+  const target = join(folder, fileName)
+  let stats
+  try {
+    stats = await lstat(target)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false }
+    return { exists: true, regular: false }
+  }
+  if (stats.isSymbolicLink()) return { exists: true, regular: false, symlink: true }
+  if (!stats.isFile()) return { exists: true, regular: false }
+  let realTarget
+  try {
+    realTarget = await realpath(target)
+  } catch {
+    return { exists: true, regular: false }
+  }
+  if (!isInside(realFolder, realTarget) || !isInside(realCwd, realTarget)) {
+    return { exists: true, regular: false }
+  }
+  return { exists: true, regular: true, real: realTarget }
+}
+
+/**
+ * Read one named bundle file through the boundary-checked reader.
+ * Symlinks, non-regular files, and realpath escapes are refused.
+ * @param {string} folder - Handoff folder path.
+ * @param {string} realFolder - Real handoff folder path.
+ * @param {string} realCwd - Real session working directory.
+ * @param {string} fileName - Fixed bundle file name.
+ * @returns {Promise<string>} UTF-8 content.
+ */
+async function readBundleFile(folder, realFolder, realCwd, fileName) {
+  const info = await bundleFileInfo(folder, realFolder, realCwd, fileName)
+  if (!info.exists) {
+    const error = new Error(`${fileName} is missing from the handoff folder.`)
+    error.code = 'ENOENT'
+    throw error
+  }
+  if (!info.regular) {
+    throw new Error(`${fileName} is a symlink, non-regular file, or resolves outside the handoff folder, so it was not read.`)
+  }
+  try {
+    return await readFile(info.real, 'utf8')
+  } catch (error) {
+    throw new Error(`${fileName} could not be read from the handoff folder. Check permissions and try again.`, { cause: error })
+  }
+}
+
+/**
+ * Preflight a handoff folder before any final write: reject unexpected entries
+ * and symlinked/non-regular known files. Nothing is modified.
+ * @param {string} folder - Handoff folder path.
+ * @param {string} realFolder - Real handoff folder path.
+ * @param {string} realCwd - Real session working directory.
+ */
+async function preflightHandoffFolder(folder, realFolder, realCwd) {
+  let entries
+  try {
+    entries = await readdir(folder, { withFileTypes: true })
+  } catch (error) {
+    throw new Error('The handoff folder could not be listed, so finalize did not write any artifact. Check the folder and try again.', { cause: error })
+  }
+  for (const entry of entries) {
+    if (!BUNDLE_ENTRIES.has(entry.name)) {
+      throw new Error('The handoff folder contains an unexpected entry. Remove it and call action "finalize" again; no final artifact was written.')
+    }
+    if (entry.isSymbolicLink() || !entry.isFile()) {
+      throw new Error(`The handoff folder contains a symlink or non-regular entry where ${entry.name} is expected. Repair it and call action "finalize" again; no final artifact was written.`)
+    }
+    const info = await bundleFileInfo(folder, realFolder, realCwd, entry.name)
+    if (!info.exists || info.regular !== true) {
+      throw new Error(`The handoff folder's ${entry.name} is not a safe regular file, so finalize did not write any artifact. Repair it and try again.`)
+    }
+  }
+}
+
+/**
+ * Inspect a bundle's publish state from its manifest and artifact files.
+ * Ready requires a parsed manifest with status "ready" and all four final
+ * artifacts present as regular files.
+ * @param {string} folder - Handoff folder path.
+ * @param {string} realFolder - Real handoff folder path.
+ * @param {string} realCwd - Real session working directory.
+ * @returns {Promise<{ status: 'ready'|'awaiting_translation'|'incomplete'|'invalid', reason?: string }>} State.
+ */
+async function inspectBundleState(folder, realFolder, realCwd) {
+  const manifestInfo = await bundleFileInfo(folder, realFolder, realCwd, 'manifest.json')
+  if (manifestInfo.exists) {
+    if (manifestInfo.regular !== true) return { status: 'invalid', reason: 'manifest_not_regular' }
+    let text
+    try {
+      text = await readBundleFile(folder, realFolder, realCwd, 'manifest.json')
+    } catch {
+      return { status: 'invalid', reason: 'manifest_unreadable' }
+    }
+    let manifest
+    try {
+      manifest = JSON.parse(text)
+    } catch {
+      return { status: 'invalid', reason: 'manifest_not_json' }
+    }
+    if (manifest === null || typeof manifest !== 'object' || Array.isArray(manifest)
+      || manifest.status !== 'ready'
+      || !Array.isArray(manifest.artifacts)
+      || !FINAL_ARTIFACTS.every((artifactName) => manifest.artifacts.includes(artifactName))) {
+      return { status: 'invalid', reason: 'manifest_invalid' }
+    }
+    for (const artifactName of FINAL_ARTIFACTS) {
+      const info = await bundleFileInfo(folder, realFolder, realCwd, artifactName)
+      if (!info.exists) return { status: 'incomplete', reason: 'missing_artifact' }
+      if (info.regular !== true) return { status: 'invalid', reason: 'artifact_not_regular' }
+    }
+    return { status: 'ready' }
+  }
+
+  const briefInfo = await bundleFileInfo(folder, realFolder, realCwd, 'BRIEF.json')
+  if (briefInfo.exists) {
+    if (briefInfo.regular !== true) return { status: 'invalid', reason: 'brief_not_regular' }
+    return { status: 'awaiting_translation' }
+  }
+  return { status: 'incomplete', reason: 'no_staging_or_manifest' }
+}
+
+/**
+ * Current time for handoff folder naming, with an optional test clock.
+ * @param {object} ctx - Host plugin context.
+ * @returns {Date} Current or test time.
+ */
+function clockNow(ctx) {
+  const candidate = ctx?.clock?.now
+  if (typeof candidate === 'function') {
+    const value = candidate()
+    if (value instanceof Date && Number.isFinite(value.getTime())) return value
+  }
+  if (candidate instanceof Date && Number.isFinite(candidate.getTime())) return candidate
+  return new Date()
 }
 
 /**
@@ -1939,9 +2198,10 @@ async function findLatestBundle(cwd, sessionId) {
  * @param {string} cwd - Session working directory.
  * @param {string} realCwd - Real path of the working directory.
  * @param {string} sessionId - Sanitized session id.
+ * @param {Date} now - Timestamp used for the folder name.
  * @returns {Promise<string>} Absolute folder path inside the working directory.
  */
-async function createHandoffFolder(cwd, realCwd, sessionId) {
+async function createHandoffFolder(cwd, realCwd, sessionId, now = new Date()) {
   const root = join(cwd, HANDOFF_ROOT)
   try {
     await mkdir(root)
@@ -1976,7 +2236,7 @@ async function createHandoffFolder(cwd, realCwd, sessionId) {
     throw new Error('The session handoff folder resolves outside the session working directory, so nothing was created. Remove or replace that link and try again.')
   }
 
-  const stamp = formatUtcStamp(new Date())
+  const stamp = formatUtcStamp(now)
   let attempt = 0
   for (;;) {
     const candidate = join(sessionDir, attempt === 0 ? `handoff-${stamp}` : `handoff-${stamp}-${attempt}`)
@@ -2268,12 +2528,15 @@ function renderPromptDocument(prompt) {
  * Recursively prove the published folder is English-only and trace-free in
  * names and text. Reports neutral categories and line numbers only.
  * @param {string} folder - Handoff folder.
+ * @param {{ skip?: Set<string> }} [options] - Root entries to ignore (staging files).
  */
-async function verifyFinalFolder(folder) {
+async function verifyFinalFolder(folder, options = {}) {
   const problems = []
+  const skip = options.skip ?? new Set()
   const visit = async (directory) => {
     const entries = await readdir(directory, { withFileTypes: true })
     for (const entry of entries) {
+      if (directory === folder && skip.has(entry.name)) continue
       const full = join(directory, entry.name)
       const relativeName = toPosix(relative(folder, full))
       const tracedName = hasRegionalTrace(relativeName)

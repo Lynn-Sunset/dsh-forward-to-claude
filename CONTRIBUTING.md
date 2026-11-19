@@ -9,14 +9,15 @@ required.
 npm test
 ```
 
-Or run the suite directly:
+Or run the test file directly (the supported fallback when the DSH Windows
+sandbox denies test-runner child-process pipes):
 
 ```bash
-node --test --test-isolation=none tests/integration.mjs
+node tests/integration.mjs
 ```
 
-In sandboxed environments that deny child-process pipes, the
-`--test-isolation=none` form is the supported path.
+`npm test` is the portable Node.js >=22 command used by CI; the direct form is
+only the sandbox fallback.
 
 ## Guidelines
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-forward-to-claude",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A DeepSeek Harness bundle that creates an English-only, trace-free handoff bundle and a ready-to-paste Claude prompt.",
   "type": "module",
   "main": "./index.js",
@@ -21,7 +21,7 @@
     "icon.svg"
   ],
   "scripts": {
-    "test": "node --test --test-isolation=none tests/integration.mjs"
+    "test": "node --test tests/integration.mjs"
   },
   "keywords": [
     "deepseek-harness",
