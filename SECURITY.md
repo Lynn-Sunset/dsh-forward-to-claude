@@ -1,10 +1,6 @@
 # Security
 
-## Reporting
 
-Do not open a public issue for a security-sensitive report. Contact the
-maintainer privately through the repository's security contact or GitHub
-Security Advisories.
 
 ## Design boundaries
 
