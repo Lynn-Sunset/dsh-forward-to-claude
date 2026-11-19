@@ -127,11 +127,11 @@ forward-to-claude/
 ```
 
 During processing the folder also holds `SOURCE.md` and `BRIEF.json`. Finalize
-preflights the folder, writes `HANDOFF.md`, `REVIEW.md`, and `PROMPT.md`,
-verifies them, deletes staging, and publishes `manifest.json` last as the
-success marker. If a later step fails, finalize removes the published artifacts,
-restores `SOURCE.md` and `BRIEF.json`, and leaves the bundle
-`awaiting_translation` rather than claiming `ready`.
+saves a private snapshot beside the bundle, prepares the final artifacts, and
+commits `manifest.json` only after verification. A failure before the commit
+restores the staging files. If the process exits mid-publish and status reports
+an interrupted bundle, call finalize again with the same arguments to resume
+from the snapshot. Finalize removes the snapshot after a successful commit.
 
 Copy the fenced block from `PROMPT.md` into Claude. The prompt tells Claude to
 read `HANDOFF.md`, `REVIEW.md`, and `manifest.json`, reconstruct the project
@@ -181,11 +181,13 @@ The full rule tables, ambiguity decisions, and residual limits are in
 - No network access, telemetry, or Claude communication.
 - Local reads are limited to the current working directory; selected files are
   realpath-checked against symlink/junction escapes.
-- Writes are confined to the handoff folder, with atomic temp-file writes.
+- The final artifacts stay in the handoff folder. Finalize keeps its temporary
+  files and private staging snapshot beside that folder.
 - Start realpath-checks the existing `forward-to-claude` root, the session
   folder, and the new handoff folder before writing.
 - Finalize and status re-check the folder they open.
-- Only `SOURCE.md` and `BRIEF.json` are removed; no source file is deleted.
+- Cleanup removes plugin-created staging and incomplete output files. The
+  original project files are preserved.
 - No alias-to-original mapping is written into the published bundle.
 
 ## Limits

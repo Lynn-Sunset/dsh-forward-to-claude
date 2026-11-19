@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.2] - 2026-11-19
+
+Interrupted-publish recovery and completeness fixes.
+
+- Finalize saves a private staging snapshot beside the bundle before removing
+  `SOURCE.md`/`BRIEF.json`. If the process exits mid-publish, status reports
+  `incomplete` with the recovery message, and a repeated finalize call with the
+  same arguments resumes from the snapshot. The snapshot is removed after a
+  successful commit.
+- `manifest.json` is committed only after the prepared artifacts, folder
+  inventory, and their read-back contents pass verification.
+- `status` requires both `SOURCE.md` and `BRIEF.json` for
+  `awaiting_translation`; a missing staging file is `incomplete`, and finalize
+  refuses it.
+- The fresh-process interruption regression now launches the child with
+  ignored stdio, so it also runs in the DSH Windows sandbox instead of failing
+  before the child starts.
+- Version bumped to 1.0.2; release archives rebuilt.
+
 ## [1.0.1] - 2026-11-19
 
 Safety and portability fixes found in the 1.0.0 review.

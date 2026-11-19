@@ -20,6 +20,7 @@
 
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -1983,12 +1984,12 @@ test('manifest removal makes status incomplete and finalize refuses the latest b
   )
 })
 
-test('a post-manifest failure rolls back all final artifacts and restores staging', async () => {
+test('a pre-commit failure rolls back all final artifacts and restores staging', async () => {
   const cwd = await makeCwd()
   const { harness, definition, folder, brief } = await startNoteBundle({
     cwd,
     forwardTestHooks: {
-      afterManifest: async () => {
+      beforeManifest: async () => {
         throw new Error('injected publish failure')
       },
     },
@@ -1997,7 +1998,7 @@ test('a post-manifest failure rolls back all final artifacts and restores stagin
   const briefBefore = await readFile(join(folder, 'BRIEF.json'), 'utf8')
   await assert.rejects(
     definition.execute(finalizeArgs(brief), harness.exec),
-    /rolled back|awaiting_translation/,
+    /restored for retry/,
   )
   assert.deepEqual((await readdir(folder)).sort(), ['BRIEF.json', 'SOURCE.md'])
   assert.equal(await exists(join(folder, 'HANDOFF.md')), false)
@@ -2010,19 +2011,22 @@ test('a post-manifest failure rolls back all final artifacts and restores stagin
   assert.equal(status.status, 'awaiting_translation')
 })
 
-test('a failing final scan rolls back and restores staging without claiming ready', async () => {
+test('status stays incomplete until the final verification succeeds', async () => {
   const cwd = await makeCwd()
   const { harness, definition, folder, brief } = await startNoteBundle({
     cwd,
     forwardTestHooks: {
-      afterManifest: async ({ folder: current }) => {
+      beforeManifest: async ({ folder: current }) => {
+        const status = await definition.execute({ action: 'status' }, harness.exec)
+        assert.equal(status.status, 'incomplete')
+        assert.equal(await exists(join(current, 'manifest.json')), false)
         await writeFile(join(current, 'late-中文.md'), 'late draft\n', 'utf8')
       },
     },
   })
   await assert.rejects(
     definition.execute(finalizeArgs(brief), harness.exec),
-    /rolled back|awaiting_translation/,
+    (error) => /restored for retry/.test(error.message) && /unexpected entry/.test(error.cause?.message),
   )
   assert.equal(await exists(join(folder, 'SOURCE.md')), true)
   assert.equal(await exists(join(folder, 'BRIEF.json')), true)
@@ -2032,6 +2036,61 @@ test('a failing final scan rolls back and restores staging without claiming read
   assert.equal(await exists(join(folder, 'manifest.json')), false)
   const status = await definition.execute({ action: 'status' }, harness.exec)
   assert.equal(status.status, 'awaiting_translation')
+})
+
+test('an interrupted publish preserves staging for finalize in a fresh process', async () => {
+  const cwd = await makeCwd()
+  const { harness, definition, folder, brief } = await startNoteBundle({ cwd, noteText: NOTE_TEXT })
+  const staging = await snapshot(folder)
+  const args = finalizeArgs(brief)
+  const childScript = `
+      import assert from 'node:assert/strict'
+      import * as plugin from ${JSON.stringify(new URL('../index.js', import.meta.url).href)}
+      const createHarness = ${createHarness.toString()}
+      const { definitions, exec } = createHarness({
+        cwd: ${JSON.stringify(cwd)},
+        answers: [],
+        messages: [],
+        sessionId: ${JSON.stringify(SESSION_ID)},
+        forwardTestHooks: { beforeManifest() { process.exit(86) } },
+      })
+      await definitions[0].execute(${JSON.stringify(args)}, exec)
+    `
+  // No pipes: the DSH Windows sandbox permits child processes with ignored
+  // stdio but denies piped child stdio with EPERM. The exit code still proves
+  // that the interrupted process left the on-disk recovery snapshot.
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', childScript], {
+    stdio: 'ignore',
+    timeout: 10000,
+  })
+  assert.ifError(child.error)
+  assert.equal(child.status, 86, child.stderr)
+  assert.deepEqual((await readdir(folder)).sort(), ['HANDOFF.md', 'PROMPT.md', 'REVIEW.md'])
+  assert.equal((await definition.execute({ action: 'status' }, harness.exec)).status, 'incomplete')
+  const siblings = await readdir(dirname(folder))
+  const recoveryName = siblings.find((name) => name.endsWith('.staging.json'))
+  assert.ok(recoveryName)
+  const saved = JSON.parse(await readFile(join(dirname(folder), recoveryName), 'utf8'))
+  assert.deepEqual([
+    { rel: 'BRIEF.json', sha256: sha256(saved.briefText) },
+    { rel: 'SOURCE.md', sha256: sha256(saved.sourceText) },
+  ], staging)
+
+  assert.equal((await definition.execute(args, harness.exec)).status, 'ready')
+  assert.deepEqual(await readdir(dirname(folder)), [basename(folder)])
+  assert.deepEqual((await readdir(folder)).sort(), ['HANDOFF.md', 'PROMPT.md', 'REVIEW.md', 'manifest.json'])
+})
+
+test('status and finalize require both staging files', async () => {
+  for (const missing of ['SOURCE.md', 'BRIEF.json']) {
+    const cwd = await makeCwd()
+    const { harness, definition, folder, brief } = await startNoteBundle({ cwd })
+    await rm(join(folder, missing))
+    const status = await definition.execute({ action: 'status' }, harness.exec)
+    assert.equal(status.status, 'incomplete', missing)
+    await assert.rejects(definition.execute(finalizeArgs(brief), harness.exec), /latest handoff bundle is incomplete/i)
+    assert.deepEqual(await readdir(folder), [missing === 'SOURCE.md' ? 'BRIEF.json' : 'SOURCE.md'])
+  }
 })
 
 test('a ready manifest with a missing artifact is incomplete and finalize refuses it', async () => {
@@ -2163,12 +2222,13 @@ test('symlinked manifest.json makes status invalid and finalize refuses it', asy
 
 test('package test script and Node engine range are portable', async () => {
   const packageJson = JSON.parse(await readFile(join(PACKAGE_DIR, 'package.json'), 'utf8'))
-  assert.equal(packageJson.version, '1.0.1')
+  assert.match(packageJson.version, /^\d+\.\d+\.\d+$/)
   assert.equal(packageJson.scripts.test, 'node --test tests/integration.mjs')
   assert.equal(packageJson.engines.node, '>=22.0.0')
   const workflow = await readFile(join(PACKAGE_DIR, '.github', 'workflows', 'ci.yml'), 'utf8')
   assert.match(workflow, /'22'/)
   assert.match(workflow, /'24'/)
   const changelog = await readFile(join(PACKAGE_DIR, 'CHANGELOG.md'), 'utf8')
-  assert.match(changelog, /## \[1\.0\.1\]/)
+  const escapedVersion = packageJson.version.replaceAll('.', '\\.')
+  assert.match(changelog, new RegExp(`## \\[${escapedVersion}\\]`))
 })

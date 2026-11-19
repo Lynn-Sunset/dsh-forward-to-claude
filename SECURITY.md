@@ -11,8 +11,8 @@ Security Advisories.
 - No network access, telemetry, or Claude communication.
 - Reads are limited to explicitly selected files under the session working
   directory and are realpath-checked against symlink/junction escapes.
-- Writes are confined to the handoff folder; start, finalize, and status check
-  folder containment.
+- Start, finalize, and status check folder containment. Finalize writes its
+  temporary files and private staging snapshot beside the handoff folder.
 - The plugin never stores credentials and has no configuration secrets.
 - The generated prompt is plain text; it is not sent by the plugin.
 

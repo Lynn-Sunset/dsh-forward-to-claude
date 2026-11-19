@@ -52,9 +52,11 @@ const MAX_PROBLEMS = 20
 
 /** Artifacts written by a successful finalize. */
 const FINAL_ARTIFACTS = ['HANDOFF.md', 'REVIEW.md', 'PROMPT.md', 'manifest.json']
+const STAGING_FILES = ['SOURCE.md', 'BRIEF.json']
+const activeFinalizations = new Set()
 
 /** Staging and final entries a handoff folder may contain. */
-const BUNDLE_ENTRIES = new Set(['SOURCE.md', 'BRIEF.json', ...FINAL_ARTIFACTS])
+const BUNDLE_ENTRIES = new Set([...STAGING_FILES, ...FINAL_ARTIFACTS])
 
 /** Handoff folder name: timestamp plus optional numeric duplicate suffix. */
 const HANDOFF_NAME_PATTERN = /^handoff-(\d{8}-\d{6})(?:-(\d+))?$/
@@ -1240,39 +1242,66 @@ async function runFinalize(ctx, exec, args) {
   if (!isInside(realCwd, realFolder)) {
     throw new Error('The latest handoff folder resolves outside the session working directory, so it was not opened.')
   }
-  const folder = latest.folder
+  if (activeFinalizations.has(realFolder)) {
+    throw new Error('The latest handoff bundle is already being finalized. Retry when the current call finishes.')
+  }
+  activeFinalizations.add(realFolder)
+  try {
+    return await finalizeBundle(ctx, args, { cwd, realCwd, folder: latest.folder, realFolder, sessionId })
+  } finally {
+    activeFinalizations.delete(realFolder)
+  }
+}
+
+async function finalizeBundle(ctx, args, { cwd, realCwd, folder, realFolder, sessionId }) {
+  const recoveryPath = stagingSnapshotPath(realFolder)
+  const recoveryDirectory = dirname(recoveryPath)
+  const recoveryName = basename(recoveryPath)
 
   // Preflight before any write: an unexpected entry, symlink, or non-regular
   // known file must leave the staging files untouched.
   await preflightHandoffFolder(folder, realFolder, realCwd)
   const initialState = await inspectBundleState(folder, realFolder, realCwd)
+  const recoveryInfo = await bundleFileInfo(recoveryDirectory, recoveryDirectory, realCwd, recoveryName)
   if (initialState.status === 'ready') {
+    if (recoveryInfo.regular) await rm(recoveryPath, { force: true })
     throw new Error('The latest handoff bundle is already finalized (status ready). Use action "status" to inspect it, or action "start" to create a new bundle.')
   }
-  if (initialState.status === 'incomplete') {
+  if (initialState.status === 'incomplete' && !recoveryInfo.exists) {
     throw new Error('The latest handoff bundle is incomplete, so finalize refused to treat it as ready. Create a new bundle with action "start" or repair the latest folder.')
   }
   if (initialState.status === 'invalid') {
     throw new Error('The latest handoff bundle has an invalid manifest or unsafe bundle file, so finalize refused to treat it as ready. Create a new bundle with action "start" or repair the latest folder.')
   }
 
-  // Capture staging text in memory before publishing. It is restored verbatim
-  // if a later publish step fails.
-  const sourceText = await readBundleFile(folder, realFolder, realCwd, 'SOURCE.md')
-  const briefText = await readBundleFile(folder, realFolder, realCwd, 'BRIEF.json')
+  let sourceText
+  let briefText
+  let existingHandoff
+  if (recoveryInfo.exists) {
+    try {
+      const snapshot = JSON.parse(await readBundleFile(recoveryDirectory, recoveryDirectory, realCwd, recoveryName))
+      if (typeof snapshot?.sourceText !== 'string' || typeof snapshot.briefText !== 'string'
+        || (snapshot.existingHandoff !== null && typeof snapshot.existingHandoff !== 'string')) {
+        throw new Error('Invalid recovery snapshot fields.')
+      }
+      sourceText = snapshot.sourceText
+      briefText = snapshot.briefText
+      existingHandoff = snapshot.existingHandoff
+    } catch (error) {
+      throw new Error('The interrupted handoff staging snapshot could not be read. Inspect it before retrying.', { cause: error })
+    }
+  } else {
+    sourceText = await readBundleFile(folder, realFolder, realCwd, 'SOURCE.md')
+    briefText = await readBundleFile(folder, realFolder, realCwd, 'BRIEF.json')
+    const handoffInfo = await bundleFileInfo(folder, realFolder, realCwd, 'HANDOFF.md')
+    existingHandoff = handoffInfo.exists ? await readBundleFile(folder, realFolder, realCwd, 'HANDOFF.md') : null
+  }
   const brief = parseBriefText(briefText)
 
-  const handoffInfo = await bundleFileInfo(folder, realFolder, realCwd, 'HANDOFF.md')
-  const existingHandoff = handoffInfo.exists
-    ? await readBundleFile(folder, realFolder, realCwd, 'HANDOFF.md')
-    : null
-
   const supplied = typeof args?.handoff_markdown === 'string' ? args.handoff_markdown : ''
-  let handoff
-  let writeHandoff = false
+  let handoff = existingHandoff
   if (supplied.trim() !== '') {
     handoff = supplied
-    writeHandoff = true
   } else {
     if (existingHandoff === null) {
       throw new Error('No English handoff was provided. Pass the complete text as handoff_markdown, or write it to HANDOFF.md inside the handoff folder first.')
@@ -1318,96 +1347,61 @@ async function runFinalize(ctx, exec, args) {
     }
   }
 
-  const published = new Set()
-  const cleanupPublishedArtifacts = async () => {
-    for (const artifactName of FINAL_ARTIFACTS) {
-      if (!published.has(artifactName)) continue
-      await rm(join(folder, artifactName), { force: true }).catch(() => {})
-    }
+  // Keep the original staging outside the shareable bundle through the commit.
+  // If this process exits, the next finalize can load the same snapshot.
+  if (!recoveryInfo.exists) {
+    await writeAtomic(recoveryPath, JSON.stringify({ sourceText, briefText, existingHandoff }), { mode: 0o600 })
   }
-  const restoreHandoffDraft = async () => {
-    if (writeHandoff) {
-      if (existingHandoff !== null) {
-        await writeAtomic(join(folder, 'HANDOFF.md'), existingHandoff).catch(() => {})
-      } else {
-        await rm(join(folder, 'HANDOFF.md'), { force: true }).catch(() => {})
-      }
-    }
-  }
-  const restoreStaging = async () => {
-    await writeAtomic(join(folder, 'SOURCE.md'), sourceText)
-    await writeAtomic(join(folder, 'BRIEF.json'), briefText)
-  }
-  const rollbackBeforeStaging = async (message, cause) => {
-    await cleanupPublishedArtifacts()
-    await restoreHandoffDraft()
-    throw new Error(`${message} SOURCE.md and BRIEF.json were kept for retry; no final artifact was published.`, { cause })
-  }
-
-  // Write only the non-manifest artifacts first. Verify them, then run the
-  // final folder scan before deleting staging. Manifest is published last.
+  const writeOptions = { temporaryDirectory: recoveryDirectory }
+  const pendingArtifacts = writtenArtifacts.slice(0, -1)
+  const pendingNames = new Set(pendingArtifacts.map(([artifactName]) => artifactName))
   try {
-    if (writeHandoff) {
-      await writeAtomic(join(folder, 'HANDOFF.md'), handoff)
-      published.add('HANDOFF.md')
+    for (const [artifactName, content] of pendingArtifacts) {
+      if (artifactName === 'HANDOFF.md' && supplied.trim() === '' && !recoveryInfo.exists) continue
+      await writeAtomic(join(folder, artifactName), content, writeOptions)
     }
-    await writeAtomic(join(folder, 'REVIEW.md'), reviewText)
-    published.add('REVIEW.md')
-    await writeAtomic(join(folder, 'PROMPT.md'), promptDocument)
-    published.add('PROMPT.md')
-    for (const [artifactName, expected] of writtenArtifacts.slice(0, 3)) {
+    for (const stagingName of STAGING_FILES) {
+      await rm(join(folder, stagingName), { force: true })
+    }
+    await ctx?.forwardToClaudeTestHooks?.beforeManifest?.({ folder })
+    await preflightHandoffFolder(folder, realFolder, realCwd, pendingNames)
+    for (const [artifactName, expected] of pendingArtifacts) {
       const actual = await readBundleFile(folder, realFolder, realCwd, artifactName)
       if (actual !== expected) throw new Error(`The written ${artifactName} did not match the verified content.`)
-      assertArtifactTraceFree(artifactName, actual)
     }
-    await verifyFinalFolder(folder, { skip: new Set(['SOURCE.md', 'BRIEF.json']) })
+    // The manifest becomes visible only after the bundle and the pending
+    // manifest have been verified. Its atomic rename commits the publication.
+    await writeAtomic(join(folder, 'manifest.json'), manifestText, { ...writeOptions, verify: true })
   } catch (error) {
-    await rollbackBeforeStaging('Could not publish the final artifacts safely.', error)
-  }
-
-  try {
-    await rm(join(folder, 'SOURCE.md'), { force: true })
-    await rm(join(folder, 'BRIEF.json'), { force: true })
-  } catch (error) {
-    await cleanupPublishedArtifacts()
-    await restoreHandoffDraft()
-    await restoreStaging().catch(() => {})
-    throw new Error('Could not delete the staging files, so finalize rolled back and kept the bundle awaiting translation. Check permissions and try again.', { cause: error })
-  }
-
-  // manifest.json is the success marker: write and verify it last, then rescan
-  // the whole published folder. Any failure here restores staging verbatim.
-  try {
-    await ctx?.forwardToClaudeTestHooks?.beforeManifest?.({ folder })
-    await writeAtomic(join(folder, 'manifest.json'), manifestText)
-    published.add('manifest.json')
-    const actualManifest = await readBundleFile(folder, realFolder, realCwd, 'manifest.json')
-    if (actualManifest !== manifestText) throw new Error('The written manifest.json did not match the verified content.')
-    assertArtifactTraceFree('manifest.json', actualManifest)
-    await ctx?.forwardToClaudeTestHooks?.afterManifest?.({ folder })
-    await verifyFinalFolder(folder)
-  } catch (error) {
-    await cleanupPublishedArtifacts()
-    await restoreHandoffDraft()
-    let restoreFailed = false
     try {
-      await restoreStaging()
-    } catch {
-      restoreFailed = true
+      await writeAtomic(join(folder, 'SOURCE.md'), sourceText, { ...writeOptions, mode: 0o600 })
+      await writeAtomic(join(folder, 'BRIEF.json'), briefText, { ...writeOptions, mode: 0o600 })
+      if (existingHandoff === null) await rm(join(folder, 'HANDOFF.md'), { force: true })
+      else await writeAtomic(join(folder, 'HANDOFF.md'), existingHandoff, writeOptions)
+      await rm(join(folder, 'REVIEW.md'), { force: true })
+      await rm(join(folder, 'PROMPT.md'), { force: true })
+      await rm(recoveryPath, { force: true })
+    } catch (rollbackError) {
+      throw new Error('Publication failed and rollback could not finish. Retry finalize to use the saved staging snapshot.', {
+        cause: new AggregateError([error, rollbackError]),
+      })
     }
-    const suffix = restoreFailed
-      ? ' The staging files could not be fully restored; inspect the folder before retrying.'
-      : ' SOURCE.md and BRIEF.json were restored and the bundle status is awaiting_translation, not ready.'
-    throw new Error(`The handoff could not be published safely, so finalize rolled back.${suffix}`, { cause: error })
+    throw new Error('The handoff could not be published safely. SOURCE.md and BRIEF.json were restored for retry.', { cause: error })
   }
 
+  let message = `The English handoff bundle is ready at ${folderRef.path}.`
+  try {
+    await rm(recoveryPath, { force: true })
+  } catch {
+    message += ' The private staging snapshot remains. Call finalize again to retry its cleanup.'
+  }
   return {
     ok: true,
     action: 'finalize',
     status: 'ready',
     folder: folderRef.path,
     files: [...FINAL_ARTIFACTS],
-    message: `The English handoff bundle is ready at ${folderRef.path}.`,
+    message,
     prompt,
   }
 }
@@ -1950,6 +1944,10 @@ async function runStatus(ctx, exec) {
     .sort()
   const folder = folderReference(latest.folder, cwd).path
   const state = await inspectBundleState(latest.folder, realFolder, realCwd)
+  const recoveryPath = stagingSnapshotPath(realFolder)
+  const recovery = state.status === 'ready' || state.status === 'incomplete'
+    ? await bundleFileInfo(dirname(recoveryPath), dirname(recoveryPath), realCwd, basename(recoveryPath))
+    : undefined
   if (state.status === 'ready') {
     return {
       ok: true,
@@ -1957,7 +1955,8 @@ async function runStatus(ctx, exec) {
       status: 'ready',
       folder,
       files,
-      message: 'The latest handoff bundle is ready: manifest.json is valid and HANDOFF.md, REVIEW.md, PROMPT.md, and manifest.json are all present as regular files.',
+      message: 'The latest handoff bundle is ready: manifest.json is valid and HANDOFF.md, REVIEW.md, PROMPT.md, and manifest.json are all present as regular files.'
+        + (recovery?.exists ? ' A private staging snapshot remains beside the bundle. Call finalize again to retry cleanup.' : ''),
     }
   }
   if (state.status === 'awaiting_translation') {
@@ -1986,13 +1985,19 @@ async function runStatus(ctx, exec) {
     status: 'incomplete',
     folder,
     files,
-    message: 'The latest handoff bundle is incomplete: a ready manifest or the expected staging files are missing. It is not ready.',
+    message: recovery?.regular && !activeFinalizations.has(realFolder)
+      ? 'The latest handoff bundle was interrupted before publication. Call finalize again to resume from the saved staging snapshot.'
+      : 'The latest handoff bundle is incomplete: a ready manifest or the expected staging files are missing.',
   }
 }
 
 /* ------------------------------------------------------------------ */
 /* Bundle discovery and paths                                         */
 /* ------------------------------------------------------------------ */
+
+function stagingSnapshotPath(realFolder) {
+  return join(dirname(realFolder), `.${basename(realFolder)}.staging.json`)
+}
 
 /**
  * Parse a handoff folder name into its timestamp and numeric suffix.
@@ -2096,29 +2101,29 @@ async function readBundleFile(folder, realFolder, realCwd, fileName) {
 }
 
 /**
- * Preflight a handoff folder before any final write: reject unexpected entries
- * and symlinked/non-regular known files. Nothing is modified.
+ * Check a handoff folder for unexpected entries and unsafe known files.
  * @param {string} folder - Handoff folder path.
  * @param {string} realFolder - Real handoff folder path.
  * @param {string} realCwd - Real session working directory.
+ * @param {Set<string>} allowedEntries - Files allowed at the current stage.
  */
-async function preflightHandoffFolder(folder, realFolder, realCwd) {
+async function preflightHandoffFolder(folder, realFolder, realCwd, allowedEntries = BUNDLE_ENTRIES) {
   let entries
   try {
     entries = await readdir(folder, { withFileTypes: true })
   } catch (error) {
-    throw new Error('The handoff folder could not be listed, so finalize did not write any artifact. Check the folder and try again.', { cause: error })
+    throw new Error('The handoff folder could not be listed. Check the folder and try again.', { cause: error })
   }
   for (const entry of entries) {
-    if (!BUNDLE_ENTRIES.has(entry.name)) {
-      throw new Error('The handoff folder contains an unexpected entry. Remove it and call action "finalize" again; no final artifact was written.')
+    if (!allowedEntries.has(entry.name)) {
+      throw new Error('The handoff folder contains an unexpected entry. Remove it and call action "finalize" again.')
     }
     if (entry.isSymbolicLink() || !entry.isFile()) {
-      throw new Error(`The handoff folder contains a symlink or non-regular entry where ${entry.name} is expected. Repair it and call action "finalize" again; no final artifact was written.`)
+      throw new Error(`The handoff folder contains a symlink or non-regular entry where ${entry.name} is expected. Repair it and call action "finalize" again.`)
     }
     const info = await bundleFileInfo(folder, realFolder, realCwd, entry.name)
     if (!info.exists || info.regular !== true) {
-      throw new Error(`The handoff folder's ${entry.name} is not a safe regular file, so finalize did not write any artifact. Repair it and try again.`)
+      throw new Error(`The handoff folder's ${entry.name} is not a safe regular file. Repair it and try again.`)
     }
   }
 }
@@ -2162,11 +2167,11 @@ async function inspectBundleState(folder, realFolder, realCwd) {
     return { status: 'ready' }
   }
 
-  const briefInfo = await bundleFileInfo(folder, realFolder, realCwd, 'BRIEF.json')
-  if (briefInfo.exists) {
-    if (briefInfo.regular !== true) return { status: 'invalid', reason: 'brief_not_regular' }
-    return { status: 'awaiting_translation' }
+  const staging = await Promise.all(STAGING_FILES.map((name) => bundleFileInfo(folder, realFolder, realCwd, name)))
+  if (staging.some((info) => info.exists && info.regular !== true)) {
+    return { status: 'invalid', reason: 'staging_not_regular' }
   }
+  if (staging.every((info) => info.regular === true)) return { status: 'awaiting_translation' }
   return { status: 'incomplete', reason: 'no_staging_or_manifest' }
 }
 
@@ -2524,61 +2529,6 @@ function renderPromptDocument(prompt) {
 /* Verification                                                       */
 /* ------------------------------------------------------------------ */
 
-/**
- * Recursively prove the published folder is English-only and trace-free in
- * names and text. Reports neutral categories and line numbers only.
- * @param {string} folder - Handoff folder.
- * @param {{ skip?: Set<string> }} [options] - Root entries to ignore (staging files).
- */
-async function verifyFinalFolder(folder, options = {}) {
-  const problems = []
-  const skip = options.skip ?? new Set()
-  const visit = async (directory) => {
-    const entries = await readdir(directory, { withFileTypes: true })
-    for (const entry of entries) {
-      if (directory === folder && skip.has(entry.name)) continue
-      const full = join(directory, entry.name)
-      const relativeName = toPosix(relative(folder, full))
-      const tracedName = hasRegionalTrace(relativeName)
-      const safeName = hasCjk(relativeName) || tracedName || !isAsciiText(relativeName)
-        ? `entry ${problems.length + 1}`
-        : relativeName
-      if (hasCjk(relativeName)) {
-        problems.push('A file or folder name in the handoff bundle contains forbidden CJK or fullwidth characters.')
-      }
-      if (tracedName) {
-        problems.push('A file or folder name in the handoff bundle contains a forbidden regional trace.')
-      }
-      if (entry.isDirectory()) {
-        await visit(full)
-        continue
-      }
-      if (!entry.isFile()) {
-        problems.push(`${safeName} is not a regular file.`)
-        continue
-      }
-      const text = await readFile(full, 'utf8')
-      const lines = scanCjkLines(text)
-      if (lines.length > 0) {
-        problems.push(`${safeName} contains forbidden CJK or fullwidth characters at line(s) ${summarizeNumbers(lines)}.`)
-      }
-      for (const [category, tracedLines] of Object.entries(scanRegionalTraces(text))) {
-        problems.push(`${safeName} contains a forbidden regional trace (category ${category}) at line(s) ${summarizeNumbers(tracedLines)}.`)
-      }
-    }
-  }
-  await visit(folder)
-  if (problems.length > 0) {
-    const shown = problems.slice(0, MAX_PROBLEMS)
-    const hidden = problems.length - shown.length
-    throw new Error([
-      'The published handoff folder is not English-only and trace-free:',
-      ...shown.map((problem) => `- ${problem}`),
-      ...(hidden > 0 ? [`- (and ${hidden} more problem(s) not shown)`] : []),
-    ].join('\n'))
-  }
-}
-
 /* ------------------------------------------------------------------ */
 /* Text and filesystem helpers                                        */
 /* ------------------------------------------------------------------ */
@@ -2871,12 +2821,15 @@ async function fileExists(target) {
  * then rename over the target. The temp file is removed on failure.
  * @param {string} target - Destination path.
  * @param {string} content - UTF-8 content.
+ * @param {{ temporaryDirectory?: string, mode?: number, verify?: boolean }} options - Atomic write options.
  */
-async function writeAtomic(target, content) {
-  const directory = dirname(target)
-  const temp = join(directory, `.${basename(target)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
+async function writeAtomic(target, content, { temporaryDirectory = dirname(target), mode, verify = false } = {}) {
+  const temp = join(temporaryDirectory, `.${basename(target)}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`)
   try {
-    await writeFile(temp, content, 'utf8')
+    await writeFile(temp, content, { encoding: 'utf8', flag: 'wx', mode })
+    if (verify && (await readFile(temp, 'utf8')) !== content) {
+      throw new Error(`The pending ${basename(target)} did not match the verified content.`)
+    }
     await rename(temp, target)
   } catch (error) {
     await rm(temp, { force: true }).catch(() => {})

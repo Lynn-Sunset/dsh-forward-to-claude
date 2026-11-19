@@ -169,27 +169,24 @@ reported by line number and neutral category only, and no final artifact is
 written when the gate fails. `SOURCE.md` and `BRIEF.json` remain so the agent
 can fix the translation or scrub and call finalize again.
 
-On success the tool writes `HANDOFF.md` when it was supplied, then `REVIEW.md`
-and `PROMPT.md`; reads them back to verify content; runs the recursive
-CJK/regional-trace scan before deleting staging (ignoring `SOURCE.md` and
-`BRIEF.json`); deletes the two staging files; writes and verifies
-`manifest.json` last as the success marker; and runs the full recursive scan
-again. The returned value contains the ready folder, the four file names, the
-message "The English handoff bundle is ready at ...", and the ready-to-paste
-prompt.
+Finalize saves a private staging snapshot beside the handoff folder, writes
+the three Markdown artifacts, and removes the staging files from the handoff
+folder. It verifies the folder inventory and reads back the Markdown files to
+match them against the content that passed the scan. It then verifies the
+pending manifest and atomically renames it into the handoff folder. That rename
+commits the publication. The tool removes the private snapshot and returns the
+ready folder, artifact names, and ready-to-paste prompt.
 
-If writing or verifying `HANDOFF.md`, `REVIEW.md`, or `PROMPT.md` fails before
-staging deletion, finalize removes the written final artifacts and keeps
-staging. If staging deletion, manifest publication/verification, or the final
-scan fails, it removes the published artifacts, restores `SOURCE.md` and
-`BRIEF.json` from the captured text, and leaves the bundle
-`awaiting_translation` rather than returning a false `ready`.
+If a step fails before the commit, finalize restores the staging files and any
+pre-existing handoff draft, then removes the incomplete output. If the process
+exits or rollback fails, retry finalize with the same arguments to use the
+saved staging snapshot. If interruption occurs after the commit but before
+snapshot cleanup, status reports the ready bundle and identifies the remaining
+cleanup. Calling finalize again retries that cleanup.
 
-Rollback is exercised deterministically through an optional Host-context
-test seam: `ctx.forwardToClaudeTestHooks.beforeManifest({ folder })` and
-`ctx.forwardToClaudeTestHooks.afterManifest({ folder })` are called only when
-provided by the test harness. They are not a public tool parameter and have no
-effect in normal use.
+The integration harness can pause or interrupt publication through the optional
+Host-context hook `ctx.forwardToClaudeTestHooks.beforeManifest({ folder })`,
+which runs before the final verification.
 
 `manifest.json` records the version, `ready` status, creation time, neutral
 session segment, a trace-free `folder` reference, source section count and
@@ -208,10 +205,11 @@ message, and the start/status results use the trace-free relative path instead.
 `none` for the newest bundle of this session, with its folder and files. It
 never writes, renames, or deletes anything. `ready` is returned only when
 `manifest.json` exists, parses, has `status: "ready"`, lists all four final
-artifacts, and all four are regular files. A brief without a manifest is
-`awaiting_translation`; a missing manifest/artifact or absent staging is
-`incomplete`; a malformed or unsafe manifest is `invalid`. Traced file names and
-folder paths are neutralized in the response.
+artifacts, and all four are regular files. With no manifest, both regular
+staging files are required for `awaiting_translation`. A missing artifact or
+staging file yields `incomplete`. A malformed manifest or unsafe expected file
+yields `invalid`. Traced file names and folder paths are neutralized in the
+response.
 
 ## Regional-trace scanner
 
@@ -228,8 +226,8 @@ The scanner classifies text with neutral category ids:
 | `political_or_cultural` | Political bodies and titles, national day references, lunar/spring/mid-autumn/dragon-boat holidays, Double Eleven, Singles' Day, Red Packet/hongbao, guanxi, hukou, danwei. |
 | `personal_name` | High-confidence pinyin personal-name patterns: capitalized common surname plus given name, separator forms, and surname+given+digits usernames. |
 
-The same scanner runs over final artifacts, planned names, and the recursive
-folder scan. Errors contain only the category id, counts, and line numbers.
+The same scanner checks all planned final artifacts and their names. Errors
+contain only the category id, counts, and line numbers.
 No code path echoes a matched term, including missing-code-span lists, file
 labels, review notes, and scrub notes.
 
@@ -315,8 +313,8 @@ Guaranteed by construction and covered by the automated test:
   ASCII code span present in the final handoff; trace-bearing spans exempted and
   replaced;
 - no CJK or fullwidth codepoints in any emitted file name or content;
-- no known high-confidence regional trace in any emitted artifact, planned
-  name, or recursive folder scan;
+- no known high-confidence regional trace in any emitted artifact or planned
+  name;
 - a complete, true scrub attestation with clean notes;
 - complete consistency ledger coverage: one T row per ledger id, structured
   aliases present in every affected section, shared aliases allowed only for an
@@ -359,13 +357,14 @@ Not guaranteed:
   I/O is local file reads and writes inside the session working directory.
 - Reads are limited to explicitly listed files under the working directory and
   are realpath-checked against escapes.
-- Writes are confined to the handoff folder. `start` realpath-checks the
+- `start` realpath-checks the
   existing `forward-to-claude` root, the session folder, and the newly created
   handoff folder before writing; finalize and status check the folder they open.
-  Atomic writes use a temporary file in the destination directory and clean it
-  up on failure.
-- Nothing is deleted except `SOURCE.md` and `BRIEF.json` after a successful
-  verified finalize.
+  Finalize uses temporary files and a private staging snapshot beside the
+  handoff folder so the shareable folder contains only verified artifacts once
+  ready.
+- Publication and rollback clean up plugin-created staging and incomplete
+  output files. The original project files are preserved.
 
 ## Package and installation
 
@@ -381,7 +380,7 @@ spec can be used after the repository is published.
 
 ## Test
 
-The automated suite at `tests/integration.mjs` has thirty-eight test cases: the
+The automated suite at `tests/integration.mjs` has forty test cases: the
 end-to-end `start`/`finalize` path; negative finalize cases (false review
 placeholders, dropped section, injected CJK from every covered block,
 dishonest review, missing handoff); a skipped-answer case; loud-failure cases;
@@ -394,19 +393,20 @@ category plus line numbers and zero literal echo; scrub checklist validation
 (missing, every false field, empty/CJK/trace-bearing notes); traced code-span
 exemption and neutral replacement; deterministic traced-session neutralization;
 traced-cwd relative path fallback in prompt, manifest, and message; traced file
-label neutralization; neutral source-trace summaries; and seven
-context-consistency cases covering the trace-free T ledger and false template,
+label neutralization; neutral source-trace summaries; context-consistency
+cases covering the trace-free T ledger and false template,
 alias drift/missing/undeclared refusals, exact section/file-label and invented
 file-token refusals, T-row and sections_reviewed coverage, removed rows, M-row
 validation and acceptance, consistency-required/flag/notes validation, a
 complete T+M audit publishing the REVIEW table and manifest summary, and a
 red->green shared-alias regression where two distinct T rows share one
 structured alias for one entity and publish under it; transactional finalize
-preflight/rollback/manifest-last; status incomplete/invalid/ready validation;
-eleven same-second numeric-suffix ordering; timestamp and unsuffixed-suffix
-ordering; and file-symlink boundary cases that skip only when the OS denies file
-symlinks. The package test/engine contract is asserted as well. The junction
-cases skip only when the OS denies junction creation. Run:
+preflight/rollback/manifest-last; interrupted-publish recovery and fresh-process
+resume; status incomplete/invalid/ready validation with both staging files
+required; eleven same-second numeric-suffix ordering; timestamp and
+unsuffixed-suffix ordering; and file-symlink boundary cases that skip only when
+the OS denies file symlinks. The package test/engine contract is asserted as
+well. The junction cases skip only when the OS denies junction creation. Run:
 
 ```
 node --test tests/integration.mjs
