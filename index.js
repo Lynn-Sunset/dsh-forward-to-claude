@@ -1363,7 +1363,16 @@ async function finalizeBundle(ctx, args, { cwd, realCwd, folder, realFolder, ses
     for (const stagingName of STAGING_FILES) {
       await rm(join(folder, stagingName), { force: true })
     }
-    await ctx?.forwardToClaudeTestHooks?.beforeManifest?.({ folder })
+    // Cordis proxies throw on reads of undeclared services. The optional
+    // chaining operator cannot catch that getter throw, so resolve the test
+    // hook inside a guard; production contexts have no such property.
+    let beforeManifest
+    try {
+      beforeManifest = ctx.forwardToClaudeTestHooks?.beforeManifest
+    } catch {
+      beforeManifest = undefined
+    }
+    await beforeManifest?.({ folder })
     await preflightHandoffFolder(folder, realFolder, realCwd, pendingNames)
     for (const [artifactName, expected] of pendingArtifacts) {
       const actual = await readBundleFile(folder, realFolder, realCwd, artifactName)

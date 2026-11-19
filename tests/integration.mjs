@@ -138,7 +138,6 @@ function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible
     signal: new AbortController().signal,
   }
   const ctx = {
-    forwardToClaudeTestHooks: forwardTestHooks,
     effect(callback) {
       const cleanup = callback()
       effects.push(cleanup)
@@ -188,6 +187,17 @@ function createHarness({ cwd, answers, messages, sessionId = SESSION_ID, visible
       throw new Error('cannot get property "clock" without inject')
     },
   })
+  if (forwardTestHooks === undefined) {
+    Object.defineProperty(ctx, 'forwardToClaudeTestHooks', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        throw new Error('cannot get property "forwardToClaudeTestHooks" without inject')
+      },
+    })
+  } else {
+    ctx.forwardToClaudeTestHooks = forwardTestHooks
+  }
   plugin.apply(ctx)
   return { ctx, exec, definitions, sections, asks, effects, disposed, cwd, session }
 }
@@ -2257,6 +2267,18 @@ test('symlinked manifest.json makes status invalid and finalize refuses it', asy
     /symlink|non-regular/i,
   )
   assert.equal(await exists(target), true)
+})
+
+test('finalize publishes on a strict Host context without test hooks', async () => {
+  const cwd = await makeCwd()
+  const { harness, definition, brief } = await startNoteBundle({ cwd })
+  // createHarness omits forwardToClaudeTestHooks entirely and installs a
+  // throwing getter, mirroring Cordis. The optional test hook must not make
+  // production finalize fail when the property is absent.
+  const ready = await definition.execute(finalizeArgs(brief), harness.exec)
+  assert.equal(ready.status, 'ready')
+  const status = await definition.execute({ action: 'status' }, harness.exec)
+  assert.equal(status.status, 'ready')
 })
 
 test('start does not read an uninjected clock service', async () => {

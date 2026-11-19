@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.4] - 2026-11-19
+
+Production finalize compatibility fix.
+
+- Removed the unguarded read of the undeclared
+  `ctx.forwardToClaudeTestHooks` property from `finalize`. Cordis throws on a
+  missing service property even through optional chaining; the test hook is now
+  resolved inside a try/catch and is absent in production.
+- The test harness no longer defines `forwardToClaudeTestHooks` unless hooks are
+  supplied; otherwise it installs a throwing getter that mirrors Cordis.
+- Added a regression that finalizes successfully on a strict Host context with
+  no test-hook property.
+- Version bumped to 1.0.4; release archives rebuilt.
+
 ## [1.0.3] - 2026-11-19
 
 Runtime compatibility fix.
